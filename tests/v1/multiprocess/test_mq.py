@@ -711,6 +711,77 @@ def test_shared_loop_recreate():
     assert ClientPollingLoop._instance is None
 
 
+def test_shared_loop_survives_process_inbound_error():
+    """
+    Test that one client's undecodable/malformed response does not kill the
+    shared ClientPollingLoop thread for every other client in the process.
+
+    Regresses the bug where a single bad frame (e.g. a RequestType the
+    receiving client's protocol version does not recognize) propagated out
+    of ``process_inbound`` and terminated the daemon loop thread, stranding
+    every ``MessageQueueClient`` sharing it.
+    """
+    # First Party
+    from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
+    from lmcache.v1.multiprocess.mq import ClientPollingLoop
+
+    server_url = "tcp://127.0.0.1:16030"
+    context = zmq.Context.instance()
+
+    server = MessageQueueServer(server_url, context)
+    add_handler_helper(server, RequestType.NOOP, test_mq_handler_helpers.noop_handler)
+    server.start()
+
+    try:
+        client_a = MessageQueueClient(server_url, context)
+        client_b = MessageQueueClient(server_url, context)
+
+        loop = ClientPollingLoop._instance
+        assert loop is not None
+        assert loop._ref_count == 2
+
+        # Simulate a poisoned/undecodable frame landing on client_a: the
+        # first call to process_inbound raises, exactly as a decode failure
+        # would. Subsequent calls behave normally.
+        original_process_inbound = client_a.process_inbound
+        calls = {"count": 0}
+
+        def flaky_process_inbound() -> None:
+            calls["count"] += 1
+            if calls["count"] == 1:
+                # Drain the frame first, exactly like the real
+                # process_inbound does, then fail as if decoding it
+                # raised -- a real bad frame is consumed off the socket
+                # and lost, not left to be redelivered on the next poll.
+                client_a.socket.recv_multipart()
+                raise ValueError("simulated undecodable response frame")
+            original_process_inbound()
+
+        client_a.process_inbound = flaky_process_inbound  # type: ignore[method-assign]
+
+        # This request's response triggers the simulated decode failure;
+        # its future is never resolved and must time out, not hang forever.
+        poisoned_future = client_a.submit_request(RequestType.NOOP, [])
+        with pytest.raises(LMCacheTimeoutError):
+            poisoned_future.result(timeout=2)
+
+        # The shared loop thread must still be alive and servicing the
+        # *other* client despite client_a's raise.
+        future_b = client_b.submit_request(RequestType.NOOP, [])
+        assert future_b.result(timeout=5) == "NOOP_OK"
+
+        # client_a itself must also still work for subsequent requests —
+        # the raise dropped one frame, it did not permanently strand it.
+        future_a = client_a.submit_request(RequestType.NOOP, [])
+        assert future_a.result(timeout=5) == "NOOP_OK"
+
+        client_a.close()
+        client_b.close()
+        assert ClientPollingLoop._instance is None
+    finally:
+        server.close()
+
+
 # ==============================================================================
 # Thread Pool Tests
 # ==============================================================================
