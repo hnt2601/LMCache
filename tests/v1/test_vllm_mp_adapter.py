@@ -21,6 +21,7 @@ from lmcache.integration.vllm import vllm_multi_process_adapter as adapter_mod
 from lmcache.integration.vllm.experimental.dispatcher import Dispatcher
 from lmcache.integration.vllm.vllm_multi_process_adapter import (
     HeartbeatThread,
+    LMCacheMPSchedulerAdapter,
     LMCacheMPWorkerAdapter,
     LoadStoreOp,
     ParallelStrategy,
@@ -186,6 +187,69 @@ def fake_adapter(monkeypatch):
     # so individual tests start with a clean call count.
     send_mock.reset_mock()
     return adapter, send_mock, future
+
+
+def _make_scheduler_adapter() -> LMCacheMPSchedulerAdapter:
+    """Construct a scheduler adapter with the standard test arguments; the
+    network boundary must already be patched (see
+    ``fake_scheduler_adapter``)."""
+    parallel_strategy = ParallelStrategy(
+        mla_only=False,
+        vllm_world_size=1,
+        vllm_worker_id=0,
+        tp_size=1,
+        pp_size=1,
+        n_servers=1,
+    )
+    return LMCacheMPSchedulerAdapter(
+        server_urls=["tcp://127.0.0.1:0"],
+        context=MagicMock(name="zmq_context"),
+        model_name="test-model",
+        vllm_block_size=16,
+        parallel_strategy=parallel_strategy,
+        mq_timeout=5.0,
+    )
+
+
+@pytest.fixture
+def fake_scheduler_adapter(monkeypatch) -> LMCacheMPSchedulerAdapter:
+    """Build a ``LMCacheMPSchedulerAdapter`` with the network boundary
+    stubbed. ``HeartbeatThread`` is replaced by ``FakeHeartbeatThread``."""
+    fake_client = MagicMock(name="mq_client")
+    monkeypatch.setattr(adapter_mod, "MessageQueueClient", lambda *a, **kw: fake_client)
+    monkeypatch.setattr(adapter_mod, "get_lmcache_chunk_size", lambda *a, **kw: 256)
+
+    FakeHeartbeatThread.instances.clear()
+    FakeHeartbeatThread.start_hook = None
+    monkeypatch.setattr(adapter_mod, "HeartbeatThread", FakeHeartbeatThread)
+
+    return _make_scheduler_adapter()
+
+
+def test_scheduler_ensure_heartbeat_started_starts_heartbeat_per_server(
+    fake_scheduler_adapter: LMCacheMPSchedulerAdapter,
+) -> None:
+    """Regression test for #4764: ``_heartbeats`` is a ``dict`` (never
+    ``None``), so a guard written as ``is not None`` always short-circuits
+    and the scheduler-side heartbeat thread is never created -- the
+    scheduler's ``is_healthy`` then stays permanently True and a dead
+    server is never detected on the lookup/prefetch path. The guard must
+    be a truthiness check instead."""
+    adapter = fake_scheduler_adapter
+    assert adapter._heartbeats == {}
+
+    adapter._ensure_heartbeat_started()
+
+    assert len(adapter._heartbeats) == 1
+    (heartbeat,) = adapter._heartbeats.values()
+    assert isinstance(heartbeat, FakeHeartbeatThread)
+    assert "start" in heartbeat.calls
+
+    # Idempotent: a second call must not start a second thread for the
+    # same server URL (double-checked locking preserved).
+    adapter._ensure_heartbeat_started()
+    assert len(adapter._heartbeats) == 1
+    assert len(FakeHeartbeatThread.instances) == 1
 
 
 def test_register_kv_caches_updates_kv_caches_and_submits(fake_adapter):
