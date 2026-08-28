@@ -150,6 +150,22 @@ re-registers only on a genuine recovery edge (Section 6.2). A retrieve dropped
 while the server is unhealthy is still reported via `get_finished` so async loads
 cannot hang.
 
+### 6.1.1 The scheduler adapter's own heartbeat
+
+`LMCacheMPWorkerAdapter` (TP worker process, store/retrieve) and
+`LMCacheMPSchedulerAdapter` (EngineCore process, lookup/prefetch) each run an
+independent lazy-started heartbeat against every backing server — one per
+server URL on the scheduler side, since its `is_healthy` is the `all()` over
+every per-server health event (any one unhealthy server taints the whole
+adapter). The two adapters gate different request paths (store/retrieve vs.
+lookup/prefetch), so
+a bug in one guard does not surface in the other: a scheduler whose heartbeat
+never starts still serves TP-worker store/retrieve traffic normally, while
+every lookup-hit request against a server that has since restarted parks
+indefinitely, because the scheduler's `is_healthy` is vacuously always `True`
+(the `all()` over an empty `_health_events` mapping never has grounds to
+observe a server outage).
+
 ### 6.2 Recovery after a reap
 
 ```
