@@ -785,6 +785,46 @@ def test_wait_for_initial_check_unblocks_after_first_real_cycle(monkeypatch) -> 
         heartbeat.stop(timeout=10.0)
 
 
+def test_early_heartbeat_after_register_off_by_default_defers_to_first_request(
+    fake_adapter,
+) -> None:
+    """TC-210: with the knob unset (default False), register_kv_caches does
+    not start the heartbeat -- the #4687 first-check barrier on the first
+    store/retrieve remains the sole registration-to-traffic safety net."""
+    adapter = _make_worker_adapter()
+    fake_tensor = MagicMock()
+    fake_tensor.device.type = "cuda"
+
+    adapter.register_kv_caches({"layer.0": fake_tensor})
+
+    assert FakeHeartbeatThread.instances == []
+
+
+def test_early_heartbeat_after_register_on_starts_heartbeat_immediately(
+    fake_adapter,
+) -> None:
+    """TC-210: with lmcache.mp.early_heartbeat_after_register=True,
+    register_kv_caches starts the heartbeat immediately -- PINGs begin
+    before any traffic, so an idle-registered worker's last_seen never
+    goes stale even under a short registration grace. A later
+    store/retrieve must not start a second heartbeat thread."""
+    adapter = _make_worker_adapter(
+        extra_config={"lmcache.mp.early_heartbeat_after_register": True}
+    )
+    fake_tensor = MagicMock()
+    fake_tensor.device.type = "cuda"
+
+    adapter.register_kv_caches({"layer.0": fake_tensor})
+
+    assert len(FakeHeartbeatThread.instances) == 1
+    heartbeat = FakeHeartbeatThread.instances[0]
+    assert "start" in heartbeat.calls
+
+    adapter.transfer_ctx = MagicMock()
+    adapter.submit_store_request("req-1", _op([[0]]), MagicMock())
+    assert len(FakeHeartbeatThread.instances) == 1
+
+
 def test_dropped_retrieve_reported_once_via_unhealthy_get_finished(
     fake_adapter,
 ) -> None:

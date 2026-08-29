@@ -1349,6 +1349,19 @@ class LMCacheMPWorkerAdapter:
             else False
         )
 
+        # Opt-in: start the heartbeat right after register_kv_caches instead
+        # of lazily on the first store/retrieve. Default off to preserve the
+        # #4687 first-check barrier as the sole registration-to-traffic
+        # safety net; a fleet whose idle-registered workers get reaped in
+        # their warmup window (before any request starts the heartbeat) can
+        # opt in per family. Tracked for removal once upstream #4732's
+        # state-separation redesign lands.
+        self._early_heartbeat_after_register = (
+            extra_config.get("lmcache.mp.early_heartbeat_after_register", False)
+            if extra_config
+            else False
+        )
+
         # Completed store requests to report via build_connector_worker_meta
         self._completed_store_requests: dict[str, int] = {}
 
@@ -1419,6 +1432,8 @@ class LMCacheMPWorkerAdapter:
             layout_hints if layout_hints is not None else vllm_layout_hints()
         )
         self._send_register_kv_caches_request(kv_caches)
+        if self._early_heartbeat_after_register:
+            self._ensure_heartbeat_started()
 
     def _block_ids_per_group(self, op: LoadStoreOp) -> list[list[int]]:
         return expand_engine_block_ids(self.engine_group_infos, op.block_ids)
