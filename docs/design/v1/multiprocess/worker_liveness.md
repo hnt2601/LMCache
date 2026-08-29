@@ -30,6 +30,14 @@ machinery: on a genuine outage the heartbeat's pings fail, clearing `health_even
 when the server returns the unhealthy-to-healthy edge fires the recover callback,
 which re-registers — a noop when the entry survived.
 
+A second, independent trigger fires the same recover callback: PING's response is
+a per-process random boot token, not a plain success flag. ZMQ's DEALER socket
+auto-reconnects at the TCP layer, so a PING right before and right after a server
+restart can both succeed against the same `tcp://…` endpoint — just a different
+process behind it, with no `ContextEntry` for this worker. Comparing the token
+across cycles catches that case even when `health_event` never observably clears
+(Section 3, Section 6.1).
+
 ```
 engine worker adapter                            MP server
 +---------------------------+                   +--------------------------------------+
@@ -52,15 +60,26 @@ engine worker adapter                            MP server
 
 ## 3. Protocol Change
 
-The PING payload changes in place from `[]` to `[int | None]`; the response stays
-`bool`, always `True` (`None` marks an untracked prober such as the scheduler
-adapter, which registers nothing and is never reapable). PING keeps its BLOCKING
-dispatch on the NORMAL thread pool. SYNC dispatch was considered but rejected:
-SYNC runs on the MQ main loop, where a slow `REGISTER_KV_CACHE` (also SYNC) would
-block PING and make a live worker look dead. Sharing the NORMAL pool is in fact
-desirable — if the pool cannot answer PING within the heartbeat timeout, the
-worker *should* enter degraded mode (the same back-pressure signal). The payload
-change is wire-visible, so both sides upgrade together (Section 7).
+The PING payload changes in place from `[]` to `[int | None]` (`None` marks an
+untracked prober such as the scheduler adapter, which registers nothing and is
+never reapable). The response changes from `bool` (always `True`) to `int`: the
+server's per-process boot token, minted once in `ManagementModule.__init__` via
+`secrets.randbelow(2**63 - 2) + 2` (reserving `0`/`1` for the legacy interop
+below) and returned unchanged on every call for that process's lifetime. PING
+keeps its BLOCKING dispatch on the NORMAL thread pool. SYNC dispatch was
+considered but rejected: SYNC runs on the MQ main loop, where a slow
+`REGISTER_KV_CACHE` (also SYNC) would block PING and make a live worker look
+dead. Sharing the NORMAL pool is in fact desirable — if the pool cannot answer
+PING within the heartbeat timeout, the worker *should* enter degraded mode (the
+same back-pressure signal).
+
+Both wire changes are visible, but `mq.py`'s `msgspec_decode` already coerces
+bool<->int on declared-type mismatch (it decodes untyped, then coerces to the
+caller's declared class) — so an old server's `True` decodes as the reserved
+token `1` for a new client, and a new server's positive token decodes as truthy
+for an old client. No special-case code was needed for this: a rolling upgrade
+degrades to "restart detection unavailable" (token never observed to change)
+rather than a decode crash. See Section 7's "Mixed client/server versions" row.
 
 ## 4. Instance ID Generation
 
@@ -143,12 +162,20 @@ the worker adapter warns at startup when `3 x interval` exceeds the 30 s floor.
 
 The heartbeat keeps its lazy start on first store/retrieve — no pings during
 warmup; the registration grace covers that window. It starts healthy (the event
-is set at construction), so the first store/retrieve is not gated. A live worker
-then pings every interval, refreshing its server-side `last_seen`, so it is never
-reaped while alive — no re-registration is needed at start. The recover callback
-re-registers only on a genuine recovery edge (Section 6.2). A retrieve dropped
-while the server is unhealthy is still reported via `get_finished` so async loads
-cannot hang.
+is set at construction), so a store/retrieve issued before the heartbeat exists
+is not gated. The worker adapter also issues one best-effort synchronous PING at
+construction time (before the heartbeat exists) to capture the server's boot
+token; when `_ensure_heartbeat_started` later creates the heartbeat thread, it
+seeds it with that captured token and blocks the caller on
+`wait_for_initial_check` for one PING round-trip (the *first-check barrier*) —
+so a restart that happened between construction and the heartbeat's lazy start
+is caught, and re-registration triggered, before that first store/retrieve
+reaches the (possibly new) server. A live worker then pings every interval,
+refreshing its server-side `last_seen`, so it is never reaped while alive — no
+re-registration is needed while nothing changes. The recover callback
+re-registers on a genuine recovery edge or a boot-token change (Section 6.2). A
+retrieve dropped while the server is unhealthy is still reported via
+`get_finished` so async loads cannot hang.
 
 ### 6.1.1 The scheduler adapter's own heartbeat
 
@@ -180,6 +207,17 @@ T1        recover callback re-registers (id absent -> fresh context) before
 A shorter outage hits the NOOP register path, which refreshes `last_seen` and
 builds nothing — the server never asks a worker to re-register.
 
+A masked restart skips the outage entirely:
+
+```
+T0        server restarts; ZMQ's DEALER socket auto-reconnects to the same
+          endpoint -> the PING immediately before and immediately after both
+          succeed -> health_event never clears, no unhealthy->healthy edge
+T0+1tick  next PING's boot token differs from the last-observed one ->
+          recover callback fires anyway (Section 2) -> re-registers
+          <- exactly one context, same as the observable-outage case
+```
+
 ### 6.3 Shutdown
 
 `shutdown()` stops the heartbeat before sending UNREGISTER, so no stray ping
@@ -197,4 +235,5 @@ stop is already requested — a straggling cycle cannot re-create a ghost contex
 | Heartbeat thread starved, worker transferring | Store/retrieve/prepare/commit refresh `last_seen`; never reaped. |
 | Partition shorter than the reap window | No reap. On heal, the recover callback re-registers; the NOOP path refreshes `last_seen`; zero context churn. |
 | Worker crash + restart | The new process gets a fresh uuid-derived id and a fresh entry; the dead id is reaped independently. No PID-reuse aliasing. |
-| Mixed client/server versions | Every PING fails the payload-count check; the client sits permanently unhealthy. Loud, never silent corruption; upgrade both sides together. |
+| Mixed client/server versions, PING specifically | Compatible during rolling upgrades: an old boolean PING reply decodes as reserved token `1`, and a new integer token decodes as truthy for an old client (Section 3). Restart detection is simply unavailable (token never observed to change) until both sides run the int-token protocol — not a crash. |
+| Mixed client/server versions, other request types | Unrelated to PING's payload change: a `RequestType` wire-value shift between versions can still misdecode a non-PING response. Loud (the request times out), never silent corruption; upgrade both sides together within one release window. |
