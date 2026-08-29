@@ -177,6 +177,18 @@ re-registers on a genuine recovery edge or a boot-token change (Section 6.2). A
 retrieve dropped while the server is unhealthy is still reported via
 `get_finished` so async loads cannot hang.
 
+**Opt-in early start.** A worker adapter constructed with
+`kv_connector_extra_config["lmcache.mp.early_heartbeat_after_register"] = true`
+starts the heartbeat at the end of `register_kv_caches` instead of waiting for
+the first store/retrieve. PINGs then begin immediately, so `last_seen` never
+goes stale even if a fleet's `worker_registration_grace_seconds` is set short
+relative to real warmup time. Default `false`: unconditional early starts
+previously caused false-positive-unhealthy during large-model warmup + CUDA
+graph capture (the reason lazy start exists at all), so this is opt-in per
+family rather than the default, and is tracked for removal once upstream's
+state-separation redesign (PING refreshes `last_seen` without granting
+request-serving readiness) lands and replaces it outright.
+
 ### 6.1.1 The scheduler adapter's own heartbeat
 
 `LMCacheMPWorkerAdapter` (TP worker process, store/retrieve) and
