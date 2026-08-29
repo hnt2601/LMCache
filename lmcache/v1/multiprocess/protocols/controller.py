@@ -47,13 +47,23 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         # Ping
         # Payload: [instance_id] -- the sender's worker instance ID, or None
         #   for an untracked prober (the scheduler adapter).
-        # Returns: bool - Always True
+        # Returns: int - the server's per-process boot token (a positive
+        #   int, stable for the server's lifetime, freshly minted on every
+        #   restart). Comparing successive tokens lets a client detect a
+        #   restart even when consecutive PINGs both succeed against the
+        #   same endpoint (ZMQ's DEALER socket auto-reconnects at the TCP
+        #   layer, masking the restart from a plain success/failure check).
+        #   Wire-compatible during a rolling upgrade: msgspec_decode's
+        #   bool<->int coercion (mq.py) makes a legacy server's `True`
+        #   decode as the reserved token 1 for a new client, and a new
+        #   server's positive token decode as truthy for a legacy client --
+        #   restart detection is available only once both sides upgrade.
         # BLOCKING on the NORMAL pool: keeps PING off the MQ main loop (where a
         # slow SYNC REGISTER_KV_CACHE would stall it) and lets pool saturation
         # surface as worker degraded mode.
         "PING": ProtocolDefinition(
             payload_classes=[int | None],
-            response_class=bool,
+            response_class=int,
             handler_type=HandlerType.BLOCKING,
         ),
         # Get the enabled experimental intermediate tensor transfer types

@@ -3,6 +3,7 @@
 
 # Standard
 from collections.abc import Sequence
+import secrets
 import threading
 
 # First Party
@@ -62,6 +63,14 @@ class ManagementModule:
         self._reap_timeout = worker_reap_timeout_seconds
         self._reap_grace = worker_registration_grace_seconds
         self._experimental_transfer = tuple(experimental_transfer)
+
+        # Per-process random boot token, returned by ping() so clients can
+        # detect a server restart even when ZMQ's DEALER socket masks it by
+        # auto-reconnecting to the same endpoint (both PINGs still succeed).
+        # Range [2, 2**63 - 1]: 0 and 1 are reserved so a legacy bool-wire
+        # server's `True` response decodes as the fixed token 1, which can
+        # never collide with a freshly minted token here.
+        self._boot_token: int = secrets.randbelow(2**63 - 2) + 2
 
         # Periodic reaper, started only when reaping is enabled and there is
         # something to scan. Scans every reap_timeout/4, so an instance is
@@ -134,7 +143,7 @@ class ManagementModule:
         if self._reaper is not None:
             self._reaper.stop()
 
-    def ping(self, instance_id: int | None) -> bool:
+    def ping(self, instance_id: int | None) -> int:
         """Respond to a ping and refresh the sender's liveness.
 
         Args:
@@ -143,12 +152,15 @@ class ManagementModule:
                 worker's last-seen time is refreshed on every liveness target.
 
         Returns:
-            Always True.
+            This process's boot token (a positive int, stable for the
+            server's lifetime, freshly minted on every restart). A client
+            comparing successive tokens detects a restart even when both
+            PINGs succeeded against the same endpoint.
         """
         if instance_id is not None:
             for target in self._liveness_targets:
                 target.touch_instance(instance_id)
-        return True
+        return self._boot_token
 
     def _reap_cycle(self) -> ThreadRunSummary:
         """Run one reaper scan: reap stale workers, drop mirrored state.

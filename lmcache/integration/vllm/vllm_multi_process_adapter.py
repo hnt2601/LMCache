@@ -269,8 +269,8 @@ def send_ping(
     mq_client: MessageQueueClient,
     timeout: float,
     instance_id: int | None = None,
-) -> bool:
-    """Send a PING request and return the result.
+) -> int | None:
+    """Send a PING request and return the server's boot token.
 
     Args:
         mq_client: The message queue client.
@@ -279,16 +279,19 @@ def send_ping(
             liveness, or None for an untracked prober (scheduler adapter).
 
     Returns:
-        True if server is healthy, False on timeout or error.
+        The server's boot token (a positive int; a legacy bool-protocol
+        server's ``True`` response decodes as the reserved token 1 via
+        ``msgspec_decode``'s bool<->int coercion) if the ping succeeded,
+        or None on timeout or error.
     """
     try:
         future = send_lmcache_request(mq_client, RequestType.PING, [instance_id])
         return future.result(timeout=timeout)
     except TimeoutError:
-        return False
+        return None
     except Exception:
         logger.debug("Ping failed with exception", exc_info=True)
-        return False
+        return None
 
 
 @dataclass
@@ -441,6 +444,7 @@ class HeartbeatThread(PeriodicThread):
         health_event: threading.Event,
         interval: float = DEFAULT_HEARTBEAT_INTERVAL,
         instance_id: int | None = None,
+        initial_boot_token: int | None = None,
     ):
         """
         Args:
@@ -453,6 +457,11 @@ class HeartbeatThread(PeriodicThread):
             instance_id: The worker's instance ID sent with each PING so the
                 server can refresh its liveness, or None for an untracked
                 prober (the scheduler adapter).
+            initial_boot_token: The server's boot token observed before this
+                thread started (e.g. captured synchronously at adapter
+                construction), or None if none was captured. Seeds restart
+                detection so a restart that happened before this thread's
+                first PING is still caught on that first cycle.
         """
         super().__init__(
             name="lmcache-heartbeat",
@@ -463,13 +472,35 @@ class HeartbeatThread(PeriodicThread):
         self._health_event = health_event
         self._interval = interval
         self._instance_id = instance_id
+        self._last_boot_token = initial_boot_token
+        self._first_check_done = threading.Event()
 
-        # Optional callback invoked on the unhealthy->healthy edge,
-        # before the health event is set. See register_recover_callback.
+        # Optional callback invoked on the unhealthy->healthy edge or on a
+        # detected server restart, before the health event is set. See
+        # register_recover_callback.
         def noop() -> bool:
             return True
 
         self._recover_callback: Callable[[], bool] = noop
+
+    def wait_for_initial_check(self, timeout: float) -> bool:
+        """Block until this thread's first heartbeat cycle has completed.
+
+        A first-check barrier: a caller about to rely on a freshly
+        (lazily) started heartbeat can wait for one PING round-trip so a
+        server restart that happened before the heartbeat started is
+        caught -- and re-registration triggered via the recover callback
+        -- before that caller's own request reaches the (possibly new)
+        server.
+
+        Args:
+            timeout: Maximum seconds to wait.
+
+        Returns:
+            True if the first cycle completed within timeout, False if it
+            timed out first.
+        """
+        return self._first_check_done.wait(timeout)
 
     def register_recover_callback(self, callback: Callable[[], bool]) -> None:
         """Register a callback fired on the unhealthy->healthy transition.
@@ -499,11 +530,20 @@ class HeartbeatThread(PeriodicThread):
         A cycle that observes a stop request returns without firing the
         callback or touching the event — a straggler success after
         UNREGISTER must not re-register a ghost context.
+
+        The recover callback fires both on the classic unhealthy->healthy
+        edge and on a same-state boot-token change: ZMQ's DEALER socket
+        auto-reconnects at the TCP layer, so a PING right before and right
+        after a server restart can both succeed against the same endpoint
+        -- just a different process behind it. Comparing the server's
+        per-process boot token catches that case even though the health
+        event never observably cleared.
         """
         was_healthy = self._health_event.is_set()
-        healthy = send_ping(
+        token = send_ping(
             self._mq_client, timeout=self._interval, instance_id=self._instance_id
         )
+        healthy = token is not None
 
         if self.stop_requested:
             return ThreadRunSummary(
@@ -511,15 +551,27 @@ class HeartbeatThread(PeriodicThread):
                 message="stop requested; skipping health update",
             )
 
-        need_trigger_recover = (
-            healthy and not was_healthy and self._recover_callback is not None
+        restarted = (
+            healthy
+            and self._last_boot_token is not None
+            and token != self._last_boot_token
         )
+        if healthy:
+            self._last_boot_token = token
+
+        need_trigger_recover = healthy and (not was_healthy or restarted)
 
         # Try to call recover callback
         if need_trigger_recover:
-            logger.warning(
-                "LMCache server is healthy again, triggering recovery callback"
-            )
+            if restarted:
+                logger.warning(
+                    "LMCache server restarted (boot token changed); "
+                    "triggering recovery callback"
+                )
+            else:
+                logger.warning(
+                    "LMCache server is healthy again, triggering recovery callback"
+                )
             # If the callback fails, it should not become healthy
             healthy = self._recover_callback()
 
@@ -534,6 +586,7 @@ class HeartbeatThread(PeriodicThread):
             if was_healthy:
                 logger.warning("LMCache server is unhealthy — entering degraded mode")
 
+        self._first_check_done.set()
         return ThreadRunSummary(
             success=True,
             message="healthy" if healthy else "unhealthy",
@@ -1170,6 +1223,22 @@ class LMCacheMPWorkerAdapter:
             self.instance_id,
         )
 
+        # Best-effort synchronous PING to capture the server's boot token
+        # before any heartbeat exists, so a restart occurring between now
+        # and the heartbeat's lazy start (register_kv_caches / first
+        # store/retrieve) is still caught on the heartbeat's first cycle
+        # (see HeartbeatThread._execute's token comparison). Unlike the
+        # chunk-size query above, a failed ping here does not fail
+        # construction -- the worker still starts, degrading to the
+        # classic unhealthy->healthy edge for its first recovery.
+        self._initial_server_boot_token = send_ping(
+            self.mq_client, timeout=self._mq_timeout, instance_id=self.instance_id
+        )
+        if self._initial_server_boot_token is None:
+            logger.warning(
+                "Initial LMCache heartbeat failed; starting worker in degraded mode"
+            )
+
         # Registered kv caches from vLLM
         self.kv_caches: dict[str, torch.Tensor] = {}
         self._layout_hints: "LayoutHints | None" = None
@@ -1406,9 +1475,13 @@ class LMCacheMPWorkerAdapter:
         The heartbeat starts healthy (the event was set at construction). A
         live worker pings every interval, refreshing its server-side
         ``last_seen``, so it is never reaped while alive -- no re-registration
-        is needed at startup, and the first store/retrieve is not gated. The
-        recover callback still re-registers on a genuine unhealthy->healthy
-        edge (server restart).
+        is needed at startup. The recover callback re-registers on a genuine
+        unhealthy->healthy edge (server restart) and on a same-state
+        boot-token change (a restart ZMQ's auto-reconnect would otherwise
+        mask). The caller -- the first store/retrieve after registration --
+        blocks for one PING (the first-check barrier), so a restart between
+        KV registration and heartbeat startup triggers re-registration
+        before that operation reaches the new server.
         """
         if self._heartbeat is not None:
             return
@@ -1420,9 +1493,11 @@ class LMCacheMPWorkerAdapter:
                 health_event=self._health_event,
                 interval=self._heartbeat_interval,
                 instance_id=self.instance_id,
+                initial_boot_token=self._initial_server_boot_token,
             )
             heartbeat.register_recover_callback(self._reregister_kv_caches_callback)
             heartbeat.start()
+            heartbeat.wait_for_initial_check(timeout=self._heartbeat_interval + 1.0)
             self._heartbeat = heartbeat
 
     def _heartbeat_stop_requested(self) -> bool:

@@ -50,6 +50,7 @@ class FakeHeartbeatThread:
         health_event: threading.Event | None = None,
         interval: float = 0.0,
         instance_id: int | None = None,
+        initial_boot_token: int | None = None,
     ) -> None:
         self.mq_client = mq_client
         self.health_event = (
@@ -57,6 +58,7 @@ class FakeHeartbeatThread:
         )
         self.interval = interval
         self.instance_id = instance_id
+        self.initial_boot_token = initial_boot_token
         # Snapshot of the health event at construction time: lets tests
         # assert the adapter starts the heartbeat healthy (event still set).
         self.health_event_set_at_init = self.health_event.is_set()
@@ -78,6 +80,12 @@ class FakeHeartbeatThread:
             hook(self)
         else:
             self.simulate_successful_ping()
+
+    def wait_for_initial_check(self, timeout: float) -> bool:
+        """The fake always completes its first cycle synchronously inside
+        ``start()``, so the barrier never actually waits."""
+        self.calls.append("wait_for_initial_check")
+        return True
 
     def stop(self, timeout: float = 5.0) -> None:
         self.calls.append("stop")
@@ -639,7 +647,9 @@ def test_instance_id_logged_at_info_on_construction(fake_adapter, monkeypatch) -
 def test_heartbeat_lazy_start_wires_callback_before_start(fake_adapter) -> None:
     """The lazy create path starts the heartbeat healthy (no pessimistic
     clear) and wires the recover callback before ``start()``; the first
-    store is not gated. Idempotent on re-entry (no second thread)."""
+    store waits on the first-check barrier (``wait_for_initial_check``)
+    rather than being gated outright. Idempotent on re-entry (no second
+    thread)."""
     adapter, _send_mock, _ = fake_adapter
     adapter.transfer_ctx = MagicMock()
     assert adapter.is_healthy  # the constructor leaves the event set
@@ -651,8 +661,14 @@ def test_heartbeat_lazy_start_wires_callback_before_start(fake_adapter) -> None:
     # Started healthy: the event was NOT cleared before construction, so
     # the first store is not dropped.
     assert heartbeat.health_event_set_at_init is True
-    # The recover callback is wired before start() (for genuine recovery).
-    assert heartbeat.calls == ["register_recover_callback", "start"]
+    # The recover callback is wired before start(), and the caller blocks
+    # on the first-check barrier right after (for genuine recovery / #4687
+    # restart detection).
+    assert heartbeat.calls == [
+        "register_recover_callback",
+        "start",
+        "wait_for_initial_check",
+    ]
     assert adapter.is_healthy
     assert adapter.transfer_ctx.submit_store.call_count == 1
 
@@ -691,6 +707,82 @@ def test_heartbeat_first_ping_runs_callback_before_setting_event(
         heartbeat.stop(timeout=10.0)
 
     assert event_state_during_callback == [False]
+
+
+def test_heartbeat_execute_triggers_recover_on_boot_token_change(monkeypatch) -> None:
+    """#4687: a restart between two successful PINGs -- ZMQ's DEALER socket
+    auto-reconnects at the TCP layer, so both PINGs can succeed against the
+    same endpoint even though a different server process answered the
+    second one -- must still trigger the recover callback via a boot-token
+    comparison, not just the unhealthy->healthy edge (which never fires
+    here since health stays True throughout)."""
+    tokens = iter([100, 100, 999])  # third PING: a different server restarted
+    monkeypatch.setattr(adapter_mod, "send_ping", lambda *a, **kw: next(tokens))
+
+    health_event = threading.Event()
+    health_event.set()
+    heartbeat = HeartbeatThread(
+        mq_client=MagicMock(name="mq_client"),
+        health_event=health_event,
+        interval=60.0,
+    )
+    recover_calls: list[int] = []
+    heartbeat.register_recover_callback(lambda: recover_calls.append(1) or True)
+
+    heartbeat._execute()  # token=100, nothing to compare against yet
+    assert recover_calls == []
+    heartbeat._execute()  # token=100 again: unchanged, no restart
+    assert recover_calls == []
+    heartbeat._execute()  # token=999: restart detected despite healthy both times
+    assert recover_calls == [1]
+    assert health_event.is_set()
+
+
+def test_heartbeat_seeded_initial_token_detects_restart_on_first_cycle(
+    monkeypatch,
+) -> None:
+    """#4687 first-check barrier (TC-209): a restart that happened before
+    the heartbeat thread even started -- e.g. between register_kv_caches
+    and the first store/retrieve, with no traffic in between -- is still
+    caught on the heartbeat's very first cycle, because the thread is
+    seeded with the boot token captured synchronously at adapter
+    construction (``initial_boot_token``)."""
+    monkeypatch.setattr(adapter_mod, "send_ping", lambda *a, **kw: 999)
+
+    health_event = threading.Event()
+    health_event.set()
+    heartbeat = HeartbeatThread(
+        mq_client=MagicMock(name="mq_client"),
+        health_event=health_event,
+        interval=60.0,
+        initial_boot_token=100,  # captured pre-restart, at adapter __init__
+    )
+    recover_calls: list[int] = []
+    heartbeat.register_recover_callback(lambda: recover_calls.append(1) or True)
+
+    heartbeat._execute()
+
+    assert recover_calls == [1]
+
+
+def test_wait_for_initial_check_unblocks_after_first_real_cycle(monkeypatch) -> None:
+    """wait_for_initial_check blocks until the first real heartbeat cycle
+    completes, then returns True -- the actual PeriodicThread run loop,
+    not the FakeHeartbeatThread double."""
+    monkeypatch.setattr(adapter_mod, "send_ping", lambda *a, **kw: 42)
+
+    health_event = threading.Event()
+    health_event.set()
+    heartbeat = HeartbeatThread(
+        mq_client=MagicMock(name="mq_client"),
+        health_event=health_event,
+        interval=0.05,
+    )
+    heartbeat.start()
+    try:
+        assert heartbeat.wait_for_initial_check(timeout=5.0) is True
+    finally:
+        heartbeat.stop(timeout=10.0)
 
 
 def test_dropped_retrieve_reported_once_via_unhealthy_get_finished(

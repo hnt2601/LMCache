@@ -231,12 +231,15 @@ def _reset_periodic_registry():
 
 
 def test_management_ping_touches_targets() -> None:
-    """ping refreshes every target for a real id; None is ignored."""
+    """ping refreshes every target for a real id; None is ignored. The
+    same positive boot token is returned on every call for this
+    process's lifetime."""
     target = _FakeTarget()
     mgmt = ManagementModule(MagicMock(), liveness_targets=[target])
 
-    assert mgmt.ping(42) is True
-    assert mgmt.ping(None) is True
+    first = mgmt.ping(42)
+    assert isinstance(first, int) and first >= 2
+    assert mgmt.ping(None) == first
     assert target.touched == [42]
 
 
@@ -267,7 +270,7 @@ def test_management_reaper_disabled_when_timeout_zero() -> None:
         worker_reap_timeout_seconds=0.0,
     )
     assert mgmt._reaper is None
-    assert mgmt.ping(1) is True
+    assert isinstance(mgmt.ping(1), int)
 
 
 def test_management_report_status_summarizes_liveness() -> None:
