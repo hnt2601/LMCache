@@ -746,12 +746,23 @@ class LMCacheMPSchedulerAdapter:
             ev.set()
             self._health_events[url] = ev
 
-        # Heartbeat thread is created but NOT started yet.
-        # It will be lazily started on the first lookup
-        # request, by which time vLLM is fully ready.
+        # Unlike the worker adapter, the scheduler heartbeat starts
+        # eagerly, right here, instead of lazily on first lookup. The
+        # worker's lazy start exists to avoid a false-positive-unhealthy
+        # during large-model warmup + CUDA graph capture; EngineCore does
+        # neither, so there is no equivalent risk. Starting eagerly also
+        # closes a real gap: a scheduler with no lookups yet (e.g. every
+        # request hits vLLM's own prefix cache first) would otherwise
+        # leave its per-server connections completely idle -- and with
+        # no periodic PING keeping them warm, a peer that dies without a
+        # clean FIN (a pod killed ungracefully, or an idle connection's
+        # Kubernetes Service/conntrack entry silently dropped) is only
+        # discovered on the *first* real lookup, which then stalls for
+        # the full mq_timeout instead of failing fast on a heartbeat.
         self._heartbeat_interval = heartbeat_interval
         self._heartbeats: dict[str, HeartbeatThread] = {}
         self._heartbeat_lock = threading.Lock()
+        self._ensure_heartbeat_started()
 
         # For TP/PP: track partial store completions across steps.
         # Events must be reported by all world_size workers before considered complete.

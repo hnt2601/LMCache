@@ -234,6 +234,25 @@ def fake_scheduler_adapter(monkeypatch) -> LMCacheMPSchedulerAdapter:
     return _make_scheduler_adapter()
 
 
+def test_scheduler_starts_heartbeat_eagerly_at_construction(
+    fake_scheduler_adapter: LMCacheMPSchedulerAdapter,
+) -> None:
+    """The scheduler adapter must not wait for the first lookup to start
+    pinging: a scheduler that goes a long time without needing an
+    external lookup (e.g. every request hits vLLM's own prefix cache
+    first) would otherwise leave its per-server connection completely
+    idle. An idle connection cannot detect a peer that died without a
+    clean FIN, so a restart is only discovered on the *next* real
+    lookup, which then stalls for the full mq_timeout instead of
+    failing fast on a heartbeat. Starting eagerly at construction
+    closes that window -- no lookup call is needed to trigger it."""
+    adapter = fake_scheduler_adapter
+
+    assert len(adapter._heartbeats) == 1
+    (heartbeat,) = adapter._heartbeats.values()
+    assert "start" in heartbeat.calls
+
+
 def test_scheduler_ensure_heartbeat_started_starts_heartbeat_per_server(
     fake_scheduler_adapter: LMCacheMPSchedulerAdapter,
 ) -> None:
@@ -242,18 +261,20 @@ def test_scheduler_ensure_heartbeat_started_starts_heartbeat_per_server(
     and the scheduler-side heartbeat thread is never created -- the
     scheduler's ``is_healthy`` then stays permanently True and a dead
     server is never detected on the lookup/prefetch path. The guard must
-    be a truthiness check instead."""
+    be a truthiness check instead.
+
+    The scheduler now starts its heartbeat eagerly at construction (see
+    ``test_scheduler_starts_heartbeat_eagerly_at_construction``), so by
+    the time this test runs, ``_heartbeats`` is already populated --
+    this test instead pins the idempotent double-checked-locking
+    behavior on an explicit re-invocation."""
     adapter = fake_scheduler_adapter
-    assert adapter._heartbeats == {}
-
-    adapter._ensure_heartbeat_started()
-
     assert len(adapter._heartbeats) == 1
     (heartbeat,) = adapter._heartbeats.values()
     assert isinstance(heartbeat, FakeHeartbeatThread)
     assert "start" in heartbeat.calls
 
-    # Idempotent: a second call must not start a second thread for the
+    # Idempotent: calling again must not start a second thread for the
     # same server URL (double-checked locking preserved).
     adapter._ensure_heartbeat_started()
     assert len(adapter._heartbeats) == 1
