@@ -40,8 +40,36 @@ T = TypeVar("T")
 # Internal type used for the client-server communication
 RequestUID = int
 
+# TCP keepalive for every DEALER/ROUTER socket. Without this, a peer that
+# dies without sending FIN/RST (a pod killed ungracefully, or a Kubernetes
+# Service/conntrack entry silently dropped for an idle connection) is
+# invisible to a plain TCP socket until an actual send is attempted --
+# which then blocks for the OS's own retransmission-timeout backoff
+# (tens of minutes on Linux defaults), not any of this module's
+# application-level timeouts. Keepalive probes an idle connection
+# proactively so a dead peer is detected in bounded time regardless of
+# how long the connection sat idle beforehand.
+_TCP_KEEPALIVE_IDLE_SECONDS = 30
+_TCP_KEEPALIVE_INTERVAL_SECONDS = 10
+_TCP_KEEPALIVE_PROBES = 3
+
 
 # Helper functions
+def _enable_tcp_keepalive(socket: zmq.Socket) -> None:
+    """Enable TCP keepalive probing on a DEALER/ROUTER socket.
+
+    Args:
+        socket: The ZMQ socket to configure. Must be called before
+            ``connect()``/``bind()`` has any effect on keepalive
+            (setting it after is also safe -- ZMQ applies it to new
+            connections -- but before is the conventional order).
+    """
+    socket.setsockopt(zmq.TCP_KEEPALIVE, 1)
+    socket.setsockopt(zmq.TCP_KEEPALIVE_IDLE, _TCP_KEEPALIVE_IDLE_SECONDS)
+    socket.setsockopt(zmq.TCP_KEEPALIVE_INTVL, _TCP_KEEPALIVE_INTERVAL_SECONDS)
+    socket.setsockopt(zmq.TCP_KEEPALIVE_CNT, _TCP_KEEPALIVE_PROBES)
+
+
 def encode_request_uid(uid: RequestUID) -> bytes:
     return msgspec.msgpack.encode(uid)
 
@@ -283,6 +311,7 @@ class MessageQueueClient:
         # Socket
         self.ctx = context
         self.socket = self.ctx.socket(zmq.DEALER)
+        _enable_tcp_keepalive(self.socket)
         self.socket.connect(server_url)
 
         # Input queue
@@ -506,6 +535,7 @@ class MessageQueueServer:
         # Socket
         self.ctx = context
         self.socket = self.ctx.socket(zmq.ROUTER)
+        _enable_tcp_keepalive(self.socket)
         self.socket.bind(bind_url)
         # Use a cross-platform Notifier instead of zmq PUSH/PULL sockets
         # because blocking handler callbacks run on ThreadPoolExecutor

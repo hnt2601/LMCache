@@ -301,6 +301,43 @@ class MessageQueueTestHelper:
 
 
 # ==============================================================================
+# TCP Keepalive
+# ==============================================================================
+
+
+def test_client_and_server_sockets_enable_tcp_keepalive():
+    """Every DEALER/ROUTER socket must enable TCP keepalive.
+
+    Without it, a peer that dies without sending FIN/RST (a pod killed
+    ungracefully, or a Kubernetes Service/conntrack entry silently
+    dropped for an idle connection) is invisible to a plain TCP socket
+    until an actual send is attempted -- which then blocks for the OS's
+    own retransmission-timeout backoff (tens of minutes on Linux
+    defaults) rather than any of this module's application-level
+    timeouts. Keepalive bounds that detection time.
+    """
+    context = zmq.Context.instance()
+
+    client = MessageQueueClient("tcp://127.0.0.1:16050", context)
+    try:
+        assert client.socket.getsockopt(zmq.TCP_KEEPALIVE) == 1
+        assert client.socket.getsockopt(zmq.TCP_KEEPALIVE_IDLE) > 0
+        assert client.socket.getsockopt(zmq.TCP_KEEPALIVE_INTVL) > 0
+        assert client.socket.getsockopt(zmq.TCP_KEEPALIVE_CNT) > 0
+    finally:
+        client.close()
+
+    server = MessageQueueServer("tcp://127.0.0.1:16051", context)
+    try:
+        assert server.socket.getsockopt(zmq.TCP_KEEPALIVE) == 1
+        assert server.socket.getsockopt(zmq.TCP_KEEPALIVE_IDLE) > 0
+        assert server.socket.getsockopt(zmq.TCP_KEEPALIVE_INTVL) > 0
+        assert server.socket.getsockopt(zmq.TCP_KEEPALIVE_CNT) > 0
+    finally:
+        server.close()
+
+
+# ==============================================================================
 # Tests for Different RequestTypes
 # ==============================================================================
 
