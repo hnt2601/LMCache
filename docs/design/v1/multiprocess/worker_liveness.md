@@ -193,17 +193,27 @@ request-serving readiness) lands and replaces it outright.
 
 `LMCacheMPWorkerAdapter` (TP worker process, store/retrieve) and
 `LMCacheMPSchedulerAdapter` (EngineCore process, lookup/prefetch) each run an
-independent lazy-started heartbeat against every backing server — one per
-server URL on the scheduler side, since its `is_healthy` is the `all()` over
-every per-server health event (any one unhealthy server taints the whole
-adapter). The two adapters gate different request paths (store/retrieve vs.
-lookup/prefetch), so
+independent heartbeat against every backing server — one per server URL on the
+scheduler side, since its `is_healthy` is the `all()` over every per-server
+health event (any one unhealthy server taints the whole adapter). The two
+adapters gate different request paths (store/retrieve vs. lookup/prefetch), so
 a bug in one guard does not surface in the other: a scheduler whose heartbeat
 never starts still serves TP-worker store/retrieve traffic normally, while
 every lookup-hit request against a server that has since restarted parks
 indefinitely, because the scheduler's `is_healthy` is vacuously always `True`
 (the `all()` over an empty `_health_events` mapping never has grounds to
 observe a server outage).
+
+**The scheduler starts eagerly; the worker stays lazy.** The worker's lazy
+start (Section 6.1) exists specifically to dodge a false-positive-unhealthy
+during large-model warmup + CUDA graph capture — a TP-worker-process concern.
+EngineCore does neither, so the scheduler heartbeat starts at construction,
+before any lookup is ever submitted. This closes a real gap: a scheduler that
+goes a long time without needing an external lookup (every request hitting
+vLLM's own prefix cache first, or simply a quiet period right after startup)
+would otherwise leave its per-server connection completely idle. See Section
+7's "Idle connection outlives a silent peer death" row for why an idle,
+un-heartbeat'd connection is dangerous specifically in a Kubernetes topology.
 
 ### 6.2 Recovery after a reap
 
@@ -249,3 +259,4 @@ stop is already requested — a straggling cycle cannot re-create a ghost contex
 | Worker crash + restart | The new process gets a fresh uuid-derived id and a fresh entry; the dead id is reaped independently. No PID-reuse aliasing. |
 | Mixed client/server versions, PING specifically | Compatible during rolling upgrades: an old boolean PING reply decodes as reserved token `1`, and a new integer token decodes as truthy for an old client (Section 3). Restart detection is simply unavailable (token never observed to change) until both sides run the int-token protocol — not a crash. |
 | Mixed client/server versions, other request types | Unrelated to PING's payload change: a `RequestType` wire-value shift between versions can still misdecode a non-PING response. Loud (the request times out), never silent corruption; upgrade both sides together within one release window. |
+| Idle connection outlives a silent peer death | A server restart's FIN/RST can be lost (an ungraceful pod kill, or a Kubernetes Service/conntrack entry dropped for an idle connection) instead of promptly tearing down the DEALER/ROUTER socket. Without TCP keepalive (`mq.py`'s `_enable_tcp_keepalive`), a plain TCP socket has no way to notice until an actual send is attempted -- which then blocks for the OS's own retransmission-timeout backoff (tens of minutes on Linux defaults), not this module's `mq_timeout`/`heartbeat_interval`. Observed as: a request to a "recovered" server hangs for its full application-level timeout, marks the connection unhealthy, and does not self-heal because the *next* attempt (heartbeat or otherwise) hits the same dead socket. TCP keepalive bounds detection to `TCP_KEEPALIVE_IDLE + TCP_KEEPALIVE_INTVL * TCP_KEEPALIVE_CNT` regardless of how long the connection sat idle; starting the scheduler's heartbeat eagerly (Section 6.1.1) additionally shrinks the window during which its connection could go idle in the first place. |
