@@ -1447,7 +1447,10 @@ def _stepped_heartbeat(monkeypatch, tokens, initial_boot_token=None):
 
 def test_heartbeat_detects_restart_hidden_by_reconnect(monkeypatch) -> None:
     """Both PINGs succeed, but the boot token changed: re-register."""
-    heartbeat, recoveries = _stepped_heartbeat(monkeypatch, [111, 111, 222, 222])
+    heartbeat, recoveries = _stepped_heartbeat(
+        monkeypatch,
+        [111, 111, 222, 222, 222],  # 4th: PING after re-register
+    )
     assert not heartbeat.wait_for_initial_check(timeout=0)
     heartbeat._execute()
     assert heartbeat.wait_for_initial_check(timeout=0)
@@ -1463,7 +1466,7 @@ def test_heartbeat_initial_token_catches_restart_before_first_cycle(
     monkeypatch,
 ) -> None:
     heartbeat, recoveries = _stepped_heartbeat(
-        monkeypatch, [222], initial_boot_token=-111
+        monkeypatch, [222, 222], initial_boot_token=-111
     )
     heartbeat._execute()
     assert recoveries == [1]
@@ -1472,7 +1475,10 @@ def test_heartbeat_initial_token_catches_restart_before_first_cycle(
 def test_heartbeat_reregisters_when_server_no_longer_tracks_it(monkeypatch) -> None:
     """A negative token (reaped while alive) triggers re-registration on each
     such reply, without being mistaken for a restart afterwards."""
-    heartbeat, recoveries = _stepped_heartbeat(monkeypatch, [111, -111, 111, 111])
+    heartbeat, recoveries = _stepped_heartbeat(
+        monkeypatch,
+        [111, -111, 111, 111, 111],  # 3rd: PING after re-register
+    )
     heartbeat._execute()
     heartbeat._execute()
     assert recoveries == [1]
@@ -1482,7 +1488,10 @@ def test_heartbeat_reregisters_when_server_no_longer_tracks_it(monkeypatch) -> N
 
 
 def test_heartbeat_failed_reregistration_stays_degraded(monkeypatch) -> None:
-    heartbeat, _ = _stepped_heartbeat(monkeypatch, [111, -111, -111, 111])
+    heartbeat, _ = _stepped_heartbeat(
+        monkeypatch,
+        [111, -111, -111, 111, 111],  # last: PING after re-register
+    )
     heartbeat.register_recover_callback(lambda: False)
     heartbeat._execute()
     assert heartbeat._health_event.is_set()
@@ -1506,6 +1515,29 @@ def test_heartbeat_first_check_released_when_cycle_raises(monkeypatch) -> None:
     with pytest.raises(RuntimeError):
         heartbeat._execute()
     assert heartbeat.wait_for_initial_check(timeout=0)
+
+
+def test_heartbeat_pings_right_after_a_successful_reregistration(monkeypatch) -> None:
+    """The recovery PING came before the new registration; one more PING right
+    after it latches liveness on the server (reap timeout, not grace)."""
+    pings: list[int | None] = []
+    replies = iter([111, 222, 222])
+
+    def ping(req_client, timeout, instance_id=None):
+        pings.append(instance_id)
+        return next(replies)
+
+    monkeypatch.setattr(adapter_mod, "send_ping", ping)
+    health_event = threading.Event()
+    health_event.set()
+    heartbeat = HeartbeatThread(
+        req_client=MagicMock(), health_event=health_event, interval=60.0, instance_id=7
+    )
+    heartbeat.register_recover_callback(lambda: True)
+    heartbeat._execute()
+    assert pings == [7]
+    heartbeat._execute()  # restart detected -> re-register -> extra PING
+    assert pings == [7, 7, 7]
 
 
 def test_heartbeat_legacy_server_token_never_triggers_recovery(monkeypatch) -> None:

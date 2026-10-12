@@ -629,6 +629,17 @@ class HeartbeatThread(PeriodicThread):
                 self._health_event.clear()
             # If the callback fails, it should not become healthy
             healthy = self._recover_callback()
+            if healthy and self._instance_id is not None:
+                # The PING that triggered the recovery preceded the new
+                # registration, so the server has not seen this instance ping
+                # yet and would judge it by the (long) registration grace, not
+                # the reap timeout, until the next cycle: a worker dying in
+                # between would keep its KV pool mapped for hours. Ping now.
+                send_ping(
+                    self._req_client,
+                    timeout=self._interval,
+                    instance_id=self._instance_id,
+                )
 
         if healthy:
             self._health_event.set()
