@@ -438,23 +438,112 @@ def test_stale_wait_on_registered_instance_blocks_its_device(
     ctx_same.close.assert_called_once()
 
 
+def _stop_unmappers(module) -> None:
+    for unmap_queue in list(module._unmap_queues.values()):
+        unmap_queue.put(None)
+
+
+def _wait_for(predicate, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while not predicate() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return predicate()
+
+
 def test_unregister_never_unmaps_on_the_caller_thread(monkeypatch, clock, dev) -> None:
-    """With a real (not inline) unmapper, UNREGISTER returns before the unmap,
-    which runs on the lmcache-mp-ipc-unmap thread."""
+    """With the real unmappers, UNREGISTER returns before the unmap, which
+    runs on the device's own lmcache-mp-ipc-unmap thread."""
     module = _module(monkeypatch)
-    del module._submit_unmap  # restore the real thread-backed unmapper
+    del module._submit_unmap  # restore the real thread-backed unmappers
     stream = _Stream(drained=True)
     ctx = _register(module, monkeypatch, clock, 1, stream, _LegacyBackend())
     closed_on: list[str] = []
     ctx.close.side_effect = lambda: closed_on.append(threading.current_thread().name)
 
     module.unregister_kv_cache(1)
-    deadline = time.monotonic() + 5
-    while not closed_on and time.monotonic() < deadline:
-        time.sleep(0.01)
 
-    assert closed_on == ["lmcache-mp-ipc-unmap"]
-    module._unmap_queue.put(None)
+    assert _wait_for(lambda: bool(closed_on))
+    assert closed_on == ["lmcache-mp-ipc-unmap-cuda:0"]
+    assert _wait_for(lambda: module.release_status()["unmapping"] == 0)
+    _stop_unmappers(module)
+
+
+def test_blocked_unmap_on_one_gpu_does_not_delay_another(
+    monkeypatch, clock, dev
+) -> None:
+    """An unmap stuck in the driver on cuda:0 must not hold up cuda:1."""
+    module = _module(monkeypatch)
+    del module._submit_unmap
+    release_gpu0 = threading.Event()
+    s0, s1 = _Stream(drained=True), _Stream(drained=True)
+    ctx0 = _register(module, monkeypatch, clock, 1, s0, _LegacyBackend(), "cuda:0")
+    ctx1 = _register(module, monkeypatch, clock, 2, s1, _LegacyBackend(), "cuda:1")
+    ctx0.close.side_effect = lambda: release_gpu0.wait(10)
+
+    module.unregister_kv_cache(1)
+    assert _wait_for(lambda: ctx0.close.called)  # cuda:0 unmap now blocked
+    module.unregister_kv_cache(2)
+
+    assert _wait_for(lambda: ctx1.close.called)
+    assert module.release_status()["unmapping"] == 1  # only cuda:0 in flight
+    release_gpu0.set()
+    assert _wait_for(lambda: module.release_status()["unmapping"] == 0)
+    _stop_unmappers(module)
+
+
+def test_unmapper_rechecks_gating_before_closing(monkeypatch, clock, dev) -> None:
+    """A device can get a stuck stream after a job was queued; the unmapper
+    waits for it to clear instead of blocking in the driver."""
+    module = _module(monkeypatch)
+    del module._submit_unmap
+    dead = _Stream(drained=False)
+    ctx_dead = _register(
+        module, monkeypatch, clock, 1, dead, _LegacyBackend(), "cuda:0"
+    )
+    ctx_dead.held_imports_snapshot.return_value = (["e"], clock.now - 60.0)
+    same = _Stream(drained=True)
+    ctx_same = _register(
+        module, monkeypatch, clock, 2, same, _LegacyBackend(), "cuda:0"
+    )
+
+    # Queue the job directly, as if gating had passed a moment earlier.
+    with module._lock:
+        entry = module._cache_contexts.pop(2)
+    module._submit_unmap([entry])
+    del entry
+    time.sleep(0.3)
+    ctx_same.close.assert_not_called()
+    assert module.release_status()["stale_wait_instance_ids"] == [1]
+
+    dead.drained = True
+    assert _wait_for(lambda: ctx_same.close.called)
+    _stop_unmappers(module)
+
+
+def test_failed_registration_rollback_runs_off_the_caller(monkeypatch, clock) -> None:
+    """Wrappers opened by a failed context construction are closed by the
+    device unmapper, not by REGISTER on the MQ loop; with no server module the
+    platform helper closes them inline."""
+    # First Party
+    from lmcache.v1.platform.base import cache_context as base_cc
+
+    module = _module(monkeypatch)
+    del module._submit_unmap
+    closed_on: list[str] = []
+    wrapper = MagicMock()
+    wrapper.close.side_effect = lambda: closed_on.append(
+        threading.current_thread().name
+    )
+
+    base_cc.close_wrappers_after_failed_init([wrapper], "cuda:3")
+    assert _wait_for(lambda: bool(closed_on))
+    assert closed_on == ["lmcache-mp-ipc-unmap-cuda:3"]
+    _stop_unmappers(module)
+
+    base_cc.set_failed_init_closer(None)
+    inline = MagicMock()
+    base_cc.close_wrappers_after_failed_init([inline], "cuda:3")
+    inline.close.assert_called_once()
 
 
 # --------------------------------------------------------------- stuck path --

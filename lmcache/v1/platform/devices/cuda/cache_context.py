@@ -39,7 +39,10 @@ from lmcache.v1.multiprocess.group_view import (
     EngineGroupInfo,
     engine_group_layer_indices,
 )
-from lmcache.v1.platform.base.cache_context import BaseCacheContext
+from lmcache.v1.platform.base.cache_context import (
+    BaseCacheContext,
+    close_wrappers_after_failed_init,
+)
 
 logger = init_logger(__name__)
 
@@ -375,8 +378,12 @@ class GPUCacheContext(BaseCacheContext):
         except BaseException:
             # Partial construction may have imported some mappings
             # already; roll them back so a failed registration does not
-            # pin the worker's KV pool.
-            self._close_kv_wrappers()
+            # pin the worker's KV pool. The unmap can block behind a stuck
+            # stream on this device, so hand it off when a closer is set.
+            close_wrappers_after_failed_init(
+                self._kv_wrappers, str(getattr(self, "device_", None))
+            )
+            self._kv_wrappers = []
             raise
 
     def _init_impl(

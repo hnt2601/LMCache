@@ -92,8 +92,9 @@ _MAPPINGS_LOCK = threading.Lock()
 # lock that would block every registration on every GPU (each opens mappings
 # here). Re-opening a handle that is still closing waits for that close.
 _CLOSING_ALLOCATIONS: dict[bytes, threading.Event] = {}
-#: How long to_tensor waits for a closing mapping of the same allocation.
-_REOPEN_WAIT_SECONDS = 30.0
+#: How long to_tensor waits for a closing mapping of the same allocation. It
+#: runs on the MQ loop (REGISTER), so fail fast and let the worker retry.
+_REOPEN_WAIT_SECONDS = 1.0
 
 
 @dataclass

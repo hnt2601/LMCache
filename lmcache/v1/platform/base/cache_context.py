@@ -18,11 +18,13 @@ import array
 import itertools
 import threading
 import time
+import weakref
 
 # Third Party
 import torch
 
 # First Party
+from lmcache.logging import init_logger
 from lmcache.v1.gpu_connector.utils import (
     get_attention_backend,
     get_concrete_engine_kv_shape_from_shape_desc,
@@ -34,6 +36,46 @@ if TYPE_CHECKING:
     # First Party
     from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
     from lmcache.v1.platform.ops_types import PageBufferShapeDesc
+
+
+logger = init_logger(__name__)
+
+#: Optional handler for wrappers left open by a failed context construction:
+#: ``closer(wrappers, device_key)``. Held weakly. The MP server installs one so
+#: the rollback unmap never runs on the caller (the MQ loop), where it could
+#: block behind a stuck stream on the same device (LMCache#4676).
+_failed_init_closer: "weakref.WeakMethod | None" = None
+
+
+def set_failed_init_closer(closer: Any | None) -> None:
+    """Install (or clear, with None) the failed-construction wrapper closer.
+
+    Args:
+        closer: A bound method ``closer(wrappers, device_key)``, or None.
+    """
+    global _failed_init_closer
+    _failed_init_closer = weakref.WeakMethod(closer) if closer is not None else None
+
+
+def close_wrappers_after_failed_init(wrappers: list[Any], device_key: str) -> None:
+    """Close IPC wrappers a failed context construction already opened.
+
+    Hands them to the installed closer when there is one, else closes them
+    here, continuing past per-wrapper failures.
+
+    Args:
+        wrappers: The wrappers to close; ownership moves to this call.
+        device_key: ``str()`` of the device they map memory on, or "None".
+    """
+    closer = _failed_init_closer() if _failed_init_closer is not None else None
+    if closer is not None:
+        closer(list(wrappers), device_key)
+        return
+    for wrapper in wrappers:
+        try:
+            wrapper.close()
+        except Exception:
+            logger.warning("KV wrapper close failed", exc_info=True)
 
 
 #: Source of import tokens; see BaseCacheContext.hold_imported_event.

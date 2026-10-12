@@ -48,7 +48,10 @@ from lmcache.v1.periodic_thread import (
     ThreadRunSummary,
     create_periodic_thread,
 )
-from lmcache.v1.platform.base.cache_context import BaseCacheContext
+from lmcache.v1.platform.base.cache_context import (
+    BaseCacheContext,
+    set_failed_init_closer,
+)
 from lmcache.v1.platform.base.event_ipc import (
     EventIPCBackend,
     get_event_ipc_backend,
@@ -328,6 +331,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             payload_type=tuple[int, L1WriteCompletion],
         )
         self._device_host_func_dispatcher.start()
+        set_failed_init_closer(self._submit_rollback_close)
 
     def _init_release_state(
         self, release_config: IPCReleaseConfig | None = None
@@ -370,12 +374,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         self._release_cycle_lock = threading.Lock()
         self._release_thread: PeriodicThread | None = None
         self._closing = False
-        # Drained batches waiting for, or being unmapped by, the unmapper.
-        self._unmap_queue: queue.SimpleQueue[list[ContextEntry] | None] = (
-            queue.SimpleQueue()
-        )
-        self._unmapper: threading.Thread | None = None
+        # One unmapper thread and job queue per device key; _unmapping counts
+        # entries queued or being unmapped.
+        self._unmap_queues: dict[str, queue.SimpleQueue] = {}
         self._unmapping = 0
+        self._query_failures_logged: set[int] = set()
 
     def _finish_write_unless_poisoned(
         self, payload: tuple[int, L1WriteCompletion]
@@ -604,16 +607,15 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         if thread is not None:
             thread.wake()
 
-    @staticmethod
-    def _stream_drained(entry: ContextEntry) -> bool:
+    def _stream_drained(self, entry: ContextEntry) -> bool:
         """Return whether the entry's transfer stream has no queued work.
 
         A query that raises (for example a sticky CUDA error) counts as not
         drained, so the entry goes through the stuck path instead of being
-        unmapped under a broken context.
+        unmapped under a broken context; it is logged once per entry.
 
         Args:
-            entry: The released entry.
+            entry: A registered or released entry.
 
         Returns:
             True when it is safe to unmap the entry's mappings.
@@ -624,7 +626,15 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         try:
             return bool(stream.query())
         except Exception:
-            logger.exception("Querying a released context stream failed")
+            key = id(entry)
+            with self._release_lock:
+                first = key not in self._query_failures_logged
+                if first:
+                    if len(self._query_failures_logged) > 10_000:
+                        self._query_failures_logged.clear()
+                    self._query_failures_logged.add(key)
+            if first:
+                logger.exception("Querying a context stream failed")
             return False
 
     @staticmethod
@@ -649,7 +659,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             oldest = None
         return list(events), oldest
 
-    def _stale_registered_devices(self, now: float) -> set[str]:
+    def _stale_registered_devices(self, now: float) -> dict[str, list[int]]:
         """Return devices where a registered instance has a stale wait.
 
         A wait older than ``stale_wait_seconds`` on a still-registered
@@ -661,37 +671,71 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             now: Current ``time.monotonic()``.
 
         Returns:
-            Device keys (see _entry_device_key).
+            Device key (see _entry_device_key) -> instance IDs with stale waits.
         """
         with self._lock:
-            entries = list(self._cache_contexts.values())
-        stale: set[str] = set()
+            entries = list(self._cache_contexts.items())
+        stale: dict[str, list[int]] = {}
         limit = self._release_config.stale_wait_seconds
-        for entry in entries:
+        for instance_id, entry in entries:
             _, oldest = self._held_imports(entry)
             if (
                 oldest is not None
                 and now - oldest > limit
                 and not self._stream_drained(entry)
             ):
-                stale.add(self._entry_device_key(entry))
+                stale.setdefault(self._entry_device_key(entry), []).append(instance_id)
         return stale
 
-    def _finalize_releases(self, entries: list[ContextEntry]) -> None:
+    def _blocked_devices(self, now: float) -> set[str]:
+        """Return devices where an unmap could block right now.
+
+        A device is blocked while a registered instance on it has a stale
+        wait or a pending release on it is not drained.
+
+        Args:
+            now: Current ``time.monotonic()``.
+
+        Returns:
+            Device keys.
+        """
+        blocked = set(self._stale_registered_devices(now))
+        with self._release_lock:
+            pending = [p.entry for p in self._pending_releases.values()]
+        for entry in pending:
+            if not self._stream_drained(entry):
+                blocked.add(self._entry_device_key(entry))
+        del pending
+        return blocked
+
+    def _finalize_releases(
+        self,
+        entries: list[ContextEntry],
+        closers: Sequence[Any] = (),
+    ) -> None:
         """Unmap drained entries and reclaim their device memory.
 
-        Runs on the unmapper thread only. ``empty_cache`` frees cached device
-        memory, which can block like an unmap, so it runs only when no release
-        is pending and no registered instance has a stale wait.
+        Runs on an unmapper thread only. ``empty_cache`` frees cached device
+        memory on every device and can block like an unmap, so it runs only
+        when no release is pending, no device is blocked and no other unmap is
+        in progress.
 
         Args:
             entries: Entries whose streams have drained. They must be the only
                 remaining references; the list is cleared before memory is
                 reclaimed.
+            closers: Extra objects with ``close()`` to close first (wrappers
+                left open by a failed registration).
         """
-        if not entries:
+        if not entries and not closers:
             return
         errors = 0
+        for closer in closers:
+            try:
+                closer.close()
+            except Exception:
+                errors += 1
+                logger.exception("Closing a rolled-back KV wrapper failed")
         for entry in entries:
             try:
                 entry.cache_context.close()
@@ -699,16 +743,17 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 # Keep going: one failed close must not strand the others.
                 errors += 1
                 logger.exception("Closing a released cache context failed")
-        del entry
+        if entries:
+            del entry
         count = len(entries)
         entries.clear()
         with self._release_lock:
             self._release_counters["released"] += count
             self._release_counters["release_errors"] += errors
-            any_pending = bool(self._pending_releases)
+            others_busy = bool(self._pending_releases) or self._unmapping > count
         # ipc_collect() only unmaps a CUDA-IPC-imported segment once its last
         # tensor reference is gone (LMCache#4014), hence the clear() above.
-        if not any_pending and not self._stale_registered_devices(time.monotonic()):
+        if not others_busy and not self._blocked_devices(time.monotonic()):
             torch_dev.empty_cache()
         ipc_collect = getattr(torch_dev, "ipc_collect", None)
         if ipc_collect is not None:
@@ -716,41 +761,84 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             ipc_collect()
 
     def _submit_unmap(self, entries: list[ContextEntry]) -> None:
-        """Queue drained entries for the unmapper thread.
+        """Queue drained entries on their devices' unmapper threads.
 
         Args:
-            entries: Entries to unmap; ownership moves to the unmapper (the
-                caller must drop its references).
+            entries: Entries to unmap; ownership moves to the unmappers (the
+                caller must drop its references). The list is cleared.
         """
-        if not entries:
-            return
+        by_device: dict[str, list[ContextEntry]] = {}
+        for entry in entries:
+            by_device.setdefault(self._entry_device_key(entry), []).append(entry)
+        if entries:
+            del entry
+        entries.clear()
+        for device_key, batch in by_device.items():
+            self._enqueue_unmap(device_key, batch, ())
+        by_device.clear()
+
+    def _submit_rollback_close(self, wrappers: list[Any], device_key: str) -> None:
+        """Close wrappers a failed registration left open, off the caller.
+
+        Installed as the platform's failed-construction closer: the caller is
+        REGISTER on the MQ loop, and the unmap could block behind a stuck
+        stream on the same device.
+
+        Args:
+            wrappers: The opened wrappers.
+            device_key: Their device, or "None" when unknown.
+        """
+        self._enqueue_unmap(device_key, [], tuple(wrappers))
+
+    def _enqueue_unmap(
+        self, device_key: str, entries: list[ContextEntry], closers: tuple
+    ) -> None:
+        """Put one job on the unmapper thread of ``device_key``."""
         with self._release_lock:
             self._unmapping += len(entries)
-            if self._unmapper is None:
-                self._unmapper = threading.Thread(
-                    target=self._unmap_loop, name="lmcache-mp-ipc-unmap", daemon=True
-                )
-                self._unmapper.start()
-        self._unmap_queue.put(entries)
+            unmap_queue = self._unmap_queues.get(device_key)
+            if unmap_queue is None:
+                unmap_queue = queue.SimpleQueue()
+                self._unmap_queues[device_key] = unmap_queue
+                threading.Thread(
+                    target=self._unmap_loop,
+                    args=(device_key, unmap_queue),
+                    name=f"lmcache-mp-ipc-unmap-{device_key}",
+                    daemon=True,
+                ).start()
+        unmap_queue.put((entries, closers))
 
-    def _unmap_loop(self) -> None:
-        """Unmapper thread: finalize queued batches until told to stop.
+    def _unmap_loop(self, device_key: str, unmap_queue: queue.SimpleQueue) -> None:
+        """Unmapper thread of one device: finalize jobs until told to stop.
 
-        An unmap may block until a stuck stream on its device is forced; it
-        runs here so that the release thread, which does the forcing, never
-        waits on it.
+        An unmap blocks while any stream on its device is stuck, so each job
+        waits until the device is no longer blocked (re-checked here, since a
+        stream can get stuck after the job was queued), and each device has
+        its own thread so a stuck GPU never delays another GPU's unmaps. The
+        release thread, which does the forcing, never waits on this.
         """
+        poll = self._release_config.poll_interval_seconds
         while True:
-            batch = self._unmap_queue.get()
-            if batch is None:
+            job = unmap_queue.get()
+            if job is None:
                 return
-            count = len(batch)
+            entries, closers = job
+            del job
+            count = len(entries)
             try:
-                self._finalize_releases(batch)
+                while True:
+                    blocked = self._blocked_devices(time.monotonic())
+                    # A rollback with an unknown device waits for every device.
+                    if not blocked or (
+                        device_key != "None" and device_key not in blocked
+                    ):
+                        break
+                    time.sleep(poll)
+                self._finalize_releases(entries, closers)
             except Exception:
                 logger.exception("Unmapping released IPC mappings failed")
             finally:
-                del batch
+                del entries, closers
                 with self._release_lock:
                     self._unmapping -= count
 
@@ -809,7 +897,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         with self._release_lock:
             pending = list(self._pending_releases.items())
         drained = {token: self._stream_drained(p.entry) for token, p in pending}
-        blocked_devices = self._stale_registered_devices(now) | {
+        blocked_devices = set(self._stale_registered_devices(now)) | {
             self._entry_device_key(p.entry)
             for token, p in pending
             if not drained[token]
@@ -978,22 +1066,30 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         """Return counters and pending state of the IPC release path.
 
         Returns:
-            A dict with the pending/stuck instance IDs and lifetime counters.
+            A dict with the pending/stuck/held-back instance IDs, the
+            registered instances blocking unmaps with a stale wait, and the
+            lifetime counters.
         """
         with self._release_lock:
-            pending = list(self._pending_releases.values())
             status: dict[str, Any] = dict(self._release_counters)
+            pending = list(self._pending_releases.values())
             status["pending_instance_ids"] = [p.instance_id for p in pending]
             status["stuck_instance_ids"] = [p.instance_id for p in pending if p.stuck]
             status["held_back_instance_ids"] = [
                 p.instance_id for p in pending if p.held_back
             ]
-            status["unmapping"] = self._unmapping
             status["force_blocked_reasons"] = {
                 str(p.instance_id): p.force_blocked for p in pending if p.force_blocked
             }
+            del pending
+            status["unmapping"] = self._unmapping
             status["stuck_action"] = self._release_config.stuck_action
             status["max_force_wait_age_seconds"] = self._max_force_wait_age
+        status["stale_wait_instance_ids"] = sorted(
+            iid
+            for ids in self._stale_registered_devices(time.monotonic()).values()
+            for iid in ids
+        )
         return status
 
     def report_status(self) -> dict:
@@ -1062,7 +1158,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             time.sleep(cfg.poll_interval_seconds)
         # Stop the unmapper after its queued work; never join it, since an
         # unmap stuck on the GPU must not hang shutdown.
-        self._unmap_queue.put(None)
+        with self._release_lock:
+            unmap_queues = list(self._unmap_queues.values())
+        for unmap_queue in unmap_queues:
+            unmap_queue.put(None)
+        set_failed_init_closer(None)
         if leftover or unmapping:
             logger.error(
                 "Shutting down with IPC release(s) still pending for instance(s) "
