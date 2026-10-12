@@ -67,7 +67,8 @@ def close_wrappers_after_failed_init(wrappers: list[Any], device_key: str) -> No
         wrappers: The wrappers to close; ownership moves to this call.
         device_key: ``str()`` of the device they map memory on, or "None".
     """
-    closer = _failed_init_closer() if _failed_init_closer is not None else None
+    ref = _failed_init_closer  # read once: close() may clear it concurrently
+    closer = ref() if ref is not None else None
     if closer is not None:
         closer(list(wrappers), device_key)
         return

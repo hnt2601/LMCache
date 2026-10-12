@@ -381,10 +381,28 @@ class GPUCacheContext(BaseCacheContext):
             # pin the worker's KV pool. The unmap can block behind a stuck
             # stream on this device, so hand it off when a closer is set.
             close_wrappers_after_failed_init(
-                self._kv_wrappers, str(getattr(self, "device_", None))
+                self._kv_wrappers, self._rollback_device_key()
             )
             self._kv_wrappers = []
             raise
+
+    def _rollback_device_key(self) -> str:
+        """Return ``str()`` of the device the wrappers map memory on.
+
+        ``device_`` is only set once the tensors are unwrapped, and an open
+        failing there is the most likely rollback, so fall back to the
+        wrappers' own device (by UUID); "None" when that is unknown too.
+        """
+        device = getattr(self, "device_", None)
+        if device is not None:
+            return str(device)
+        for wrapper in self._kv_wrappers:
+            try:
+                index = wrapper._get_device_index_from_uuid(wrapper.device_uuid)
+            except Exception:
+                continue
+            return str(torch.device("cuda", index))
+        return "None"
 
     def _init_impl(
         self,

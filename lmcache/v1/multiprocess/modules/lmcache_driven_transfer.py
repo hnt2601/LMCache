@@ -378,6 +378,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         # entries queued or being unmapped.
         self._unmap_queues: dict[str, queue.SimpleQueue] = {}
         self._unmapping = 0
+        self._unmap_stopped = False
         self._query_failures_logged: set[int] = set()
 
     def _finish_write_unless_poisoned(
@@ -795,6 +796,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
     ) -> None:
         """Put one job on the unmapper thread of ``device_key``."""
         with self._release_lock:
+            if self._unmap_stopped:
+                # Shutting down: process exit reclaims these mappings.
+                logger.warning(
+                    "Dropping an unmap job for %s queued after shutdown", device_key
+                )
+                return
             self._unmapping += len(entries)
             unmap_queue = self._unmap_queues.get(device_key)
             if unmap_queue is None:
@@ -1158,11 +1165,14 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             time.sleep(cfg.poll_interval_seconds)
         # Stop the unmapper after its queued work; never join it, since an
         # unmap stuck on the GPU must not hang shutdown.
+        # Clear the rollback hook first, then refuse new unmap jobs, so no job
+        # lands on a queue after its stop sentinel.
+        set_failed_init_closer(None)
         with self._release_lock:
+            self._unmap_stopped = True
             unmap_queues = list(self._unmap_queues.values())
         for unmap_queue in unmap_queues:
             unmap_queue.put(None)
-        set_failed_init_closer(None)
         if leftover or unmapping:
             logger.error(
                 "Shutting down with IPC release(s) still pending for instance(s) "
