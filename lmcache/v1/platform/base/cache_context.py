@@ -133,6 +133,28 @@ def check_device_alloc(device: torch.device, nbytes: int) -> None:
 #: Source of import tokens; see BaseCacheContext.hold_imported_event.
 _IMPORT_TOKENS = itertools.count()
 
+#: Context holding each outstanding import token, so a release callback finds
+#: its context whatever happened to the registration meanwhile (unregistered,
+#: reaped, mid-hand-off to a pending release).
+_HOLDERS_BY_TOKEN: "weakref.WeakValueDictionary[int, BaseCacheContext]" = (
+    weakref.WeakValueDictionary()
+)
+_HOLDERS_LOCK = threading.Lock()
+
+
+def release_imported_event_token(token: int) -> bool:
+    """Release an import hold by token, on whichever context holds it.
+
+    Args:
+        token: Token returned by :meth:`BaseCacheContext.hold_imported_event`.
+
+    Returns:
+        Whether a context still held ``token``.
+    """
+    with _HOLDERS_LOCK:
+        context = _HOLDERS_BY_TOKEN.get(token)
+    return context is not None and context.release_imported_event(token)
+
 
 class BaseCacheContext(ABC):
     """Abstract base for GPU and CPU cache contexts.
@@ -196,7 +218,9 @@ class BaseCacheContext(ABC):
             token = next(_IMPORT_TOKENS)
             self._held_imports[token] = event
             self._held_import_times[token] = time.monotonic()
-            return token
+        with _HOLDERS_LOCK:
+            _HOLDERS_BY_TOKEN[token] = self
+        return token
 
     def release_imported_event(self, token: int) -> bool:
         """Drop the imported event behind ``token``; its stream wait has drained.
@@ -207,6 +231,9 @@ class BaseCacheContext(ABC):
         Returns:
             Whether this context held ``token``.
         """
+        with _HOLDERS_LOCK:
+            if _HOLDERS_BY_TOKEN.get(token) is self:
+                del _HOLDERS_BY_TOKEN[token]
         with self._held_imports_lock:
             self._held_import_times.pop(token, None)
             return self._held_imports.pop(token, None) is not None

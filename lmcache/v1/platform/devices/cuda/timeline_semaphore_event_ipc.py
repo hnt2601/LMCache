@@ -70,6 +70,67 @@ _SLOT_BYTES = 8
 _PROBE_SLOT_OFFSET = 0
 _FIRST_ALLOCATABLE_SLOT = 1
 
+
+class _NoGilDriver:
+    """The stream memory ops called through ctypes, which drops the GIL.
+
+    Behind a wait that never completes (a dead exporter) a stream's work
+    queue fills up, and any further enqueue on it -- or other driver calls
+    meanwhile -- can block until the wait is forced. cuda-python keeps the GIL
+    while blocked, which would freeze every thread of the process, including
+    the one that forces the wait; through ctypes only the caller blocks.
+    """
+
+    def __init__(self, lib: ctypes.CDLL) -> None:
+        def fn(*names: str) -> object:
+            for name in names:
+                f = getattr(lib, name, None)
+                if f is not None:
+                    f.restype = ctypes.c_int
+                    return f
+            raise AttributeError(names[0])
+
+        args = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint]
+        self._wait = fn("cuStreamWaitValue64_v2", "cuStreamWaitValue64")
+        self._wait.argtypes = args
+        self._write = fn("cuStreamWriteValue64_v2", "cuStreamWriteValue64")
+        self._write.argtypes = args
+        self._sync = fn("cuStreamSynchronize")
+        self._sync.argtypes = [ctypes.c_void_p]
+
+    @staticmethod
+    def _check(result: int, what: str) -> None:
+        if result != 0:
+            raise RuntimeError(f"{what} failed: CUresult {result}")
+
+    def wait_value_geq(self, stream: int, address: int, value: int) -> None:
+        self._check(self._wait(stream, address, value, 0), "cuStreamWaitValue64")
+
+    def write_value(self, stream: int, address: int, value: int) -> None:
+        self._check(self._write(stream, address, value, 0), "cuStreamWriteValue64")
+
+    def synchronize(self, stream: int) -> None:
+        self._check(self._sync(stream), "cuStreamSynchronize")
+
+
+_NOGIL_DRIVER: "_NoGilDriver | None | bool" = False  # False: not loaded yet
+
+
+def _nogil_driver() -> "_NoGilDriver | None":
+    """Return the GIL-free driver ops, or None to use cuda-python."""
+    global _NOGIL_DRIVER
+    if _NOGIL_DRIVER is False:
+        try:
+            _NOGIL_DRIVER = _NoGilDriver(ctypes.CDLL("libcuda.so.1"))
+        except (OSError, AttributeError):
+            logger.warning(
+                "libcuda stream memory ops unavailable through ctypes; using "
+                "cuda-python, which holds the GIL if a stuck stream blocks it"
+            )
+            _NOGIL_DRIVER = None
+    return _NOGIL_DRIVER  # type: ignore[return-value]
+
+
 #: Wire format: version, 64-byte cudaIpcMemHandle, slot offset, sequence.
 _HANDLE_VERSION = 1
 _EXPORT_STRUCT = struct.Struct("!B64sQQ")
@@ -201,6 +262,13 @@ def _enqueue_wait(event: TimelineSemaphoreEvent, stream: object | None) -> None:
     if event.seq == _UNRECORDED_SEQ:
         return
     raw: cudaStream_t = _raw_stream_handle(stream, event.device_index)
+    nogil = _nogil_driver()
+    if nogil is not None:
+        with torch.cuda.device(event.device_index):
+            nogil.wait_value_geq(
+                int(raw), event.base_ptr + event.slot_offset, event.seq
+            )
+        return
     with torch.cuda.device(event.device_index):
         result: tuple[object, ...] = _cuda.driver.cuStreamWaitValue64(
             _cuda.driver.CUstream(raw),
@@ -332,6 +400,13 @@ class TimelineSemaphoreEventIPCBackend:
             event.handle_bytes = buffer.handle_bytes
             event.slot_offset = slot_offset
             event.seq = seq
+            nogil = _nogil_driver()
+            if nogil is not None:
+                with torch.cuda.device(event.device_index):
+                    nogil.write_value(
+                        int(stream_hdl), event.base_ptr + event.slot_offset, seq
+                    )
+                return
             with torch.cuda.device(event.device_index):
                 _CHECK_CUDA(
                     _cuda.driver.cuStreamWriteValue64(
@@ -537,14 +612,22 @@ class TimelineSemaphoreEventIPCBackend:
             if current is None or event.seq > current.seq:
                 targets[slot] = event
         written = 0
+        nogil = _nogil_driver()
         for (device_index, slot_ptr), event in targets.items():
-            # Never move a slot backwards: if the exporter (were it alive) has
-            # already recorded past the target, the wait is satisfied anyway.
-            if self._read_slot(event) >= event.seq:
-                continue
+            # No read-back of the slot first: a D2H copy can block while a
+            # stuck stream's queue is full, and the exporter is gone, so
+            # nothing else writes the slot and every awaited sequence is at
+            # most event.seq (waits are GEQ).
             # The buffer's host-ops stream never waits on anything, so this
             # write cannot queue behind the stuck stream it is meant to free.
             buffer_stream: object = self._get_buffer(device_index).buffer_ops_stream
+            if nogil is not None:
+                raw = int(_raw_stream_handle(buffer_stream, device_index))
+                with torch.cuda.device(device_index):
+                    nogil.write_value(raw, slot_ptr, event.seq)
+                    nogil.synchronize(raw)
+                written += 1
+                continue
             with torch.cuda.device(device_index):
                 _CHECK_CUDA(
                     _cuda.driver.cuStreamWriteValue64(

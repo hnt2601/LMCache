@@ -3,6 +3,7 @@
 
 # Standard
 from dataclasses import dataclass
+import contextlib
 from typing import Any, Literal, Sequence
 import os
 import queue
@@ -50,6 +51,7 @@ from lmcache.v1.periodic_thread import (
 )
 from lmcache.v1.platform.base.cache_context import (
     BaseCacheContext,
+    release_imported_event_token,
     set_device_alloc_guard,
     set_failed_init_closer,
 )
@@ -451,21 +453,36 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         """
         instance_id, import_token = payload
         entry = self.get_and_touch_context_entry(instance_id)
-        if entry is not None and entry.cache_context.release_imported_event(
-            import_token
-        ):
+        # By token, not through the registry: the registration may have been
+        # unregistered or reaped meanwhile, and its drain check (and so its
+        # release) depends on this hold being dropped.
+        if release_imported_event_token(import_token):
             return
-        # Unregistered or reaped meanwhile: the context waits in a pending
-        # release, whose drain check relies on its holds being dropped.
-        with self._release_lock:
-            contexts = [
-                p.entry.cache_context
-                for p in self._pending_releases.values()
-                if p.instance_id == instance_id
-            ]
-        for context in contexts:
-            if context.release_imported_event(import_token):
-                return
+        if entry is not None:  # a context type not tracked by token
+            entry.cache_context.release_imported_event(import_token)
+
+    def _end_held_section(
+        self, cache_context: BaseCacheContext, instance_id: int, import_token: int
+    ) -> None:
+        """Queue the release of a transfer's hold as the last op of its section.
+
+        It runs once everything the section queued on the stream has run, so
+        "no holds" means the stream has no transfer work left (see
+        _stream_drained). If it cannot be queued the hold stays: the release
+        then takes the stuck path instead of unmapping under queued work.
+        """
+        try:
+            submit_callback_to_stream(
+                cache_context.cupy_stream,
+                "release_imported_event",
+                (instance_id, import_token),
+            )
+        except Exception:
+            logger.exception(
+                "Queueing the hold release of instance %d failed; its IPC "
+                "release will be treated as stuck",
+                instance_id,
+            )
 
     def register_host_func(self, kind: str, handler: Any, payload_type: Any) -> None:
         """Register *handler* for *kind* on the per-process device host-func
@@ -678,14 +695,16 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         stream = getattr(entry.cache_context, "stream", None)
         if stream is None:
             return True
-        # A held import means a wait on a worker event is still queued on the
-        # stream. Never query it then: behind a wait that never completes the
-        # stream's work queue fills up (about 1k ops), and cudaStreamQuery on
-        # it then blocks -- holding the GIL, which freezes the whole server,
-        # including the release thread that would force the wait.
-        events, _ = self._held_imports(entry)
-        if events:
-            return False
+        if getattr(entry.cache_context, "held_imports_snapshot", None) is not None:
+            # Decided on the host, never by querying the stream: behind a wait
+            # that never completes the stream's work queue fills up (about 1k
+            # ops) and cudaStreamQuery then blocks -- holding the GIL, which
+            # freezes the whole server, including the release thread that
+            # would force the wait. Every STORE/RETRIEVE holds its imported
+            # event from before it queues anything until a callback queued as
+            # its last op has run, so no holds means no transfer work left.
+            events, _ = self._held_imports(entry)
+            return not events
         try:
             return bool(stream.query())
         except Exception:
@@ -1572,6 +1591,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         with (
             torch_dev.device(cache_context.device),
             torch_dev.stream(cache_context.stream),
+            contextlib.ExitStack() as held_section,
         ):
             event = event_backend.create_event(cache_context.device)
 
@@ -1616,20 +1636,20 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 null_block_id,
             )
 
-            block_ids_per_group_gpu = downsample_and_stage_block_ids(
-                cache_context, gpu_block_ids
-            )
-
+            # Held before anything is queued on the stream, released by the
+            # section's last op (see _end_held_section).
             producer_event = event_backend.import_event(
                 event_ipc_handle, cache_context.device
             )
-            event_backend.wait_event(producer_event, cache_context.stream)
             import_token = cache_context.hold_imported_event(producer_event)
-            submit_callback_to_stream(
-                cache_context.cupy_stream,
-                "release_imported_event",
-                (instance_id, import_token),
+            held_section.callback(
+                self._end_held_section, cache_context, instance_id, import_token
             )
+
+            block_ids_per_group_gpu = downsample_and_stage_block_ids(
+                cache_context, gpu_block_ids
+            )
+            event_backend.wait_event(producer_event, cache_context.stream)
 
             # CPU-synchronous sentinel: a GPU store is about to be enqueued.
             # Must be published via publish() (not publish_on_stream) so the
@@ -1877,6 +1897,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         with (
             torch_dev.device(cache_context.device),
             torch_dev.stream(cache_context.stream),
+            contextlib.ExitStack() as held_section,
         ):
             event = event_backend.create_event(cache_context.device)
 
@@ -1903,19 +1924,19 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 return event_backend.export_event(event, cache_context.device), False
 
             # Cut and stage all block_ids to GPU once before the transfer
-            block_ids_per_group_gpu = downsample_and_stage_block_ids(
-                cache_context, gpu_block_ids
-            )
+            # Held before anything is queued on the stream, released by the
+            # section's last op (see _end_held_section).
             producer_event = event_backend.import_event(
                 event_ipc_handle, cache_context.device
             )
-            event_backend.wait_event(producer_event, cache_context.stream)
             import_token = cache_context.hold_imported_event(producer_event)
-            submit_callback_to_stream(
-                cache_context.cupy_stream,
-                "release_imported_event",
-                (instance_id, import_token),
+            held_section.callback(
+                self._end_held_section, cache_context, instance_id, import_token
             )
+            block_ids_per_group_gpu = downsample_and_stage_block_ids(
+                cache_context, gpu_block_ids
+            )
+            event_backend.wait_event(producer_event, cache_context.stream)
 
             # Per object group, the prefetch only locked the in-window suffix
             # (the last ``num_chunks_in_sw`` chunks; the whole prefix for full

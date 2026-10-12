@@ -753,6 +753,54 @@ def test_release_callback_drops_the_hold_of_a_reaped_instance(
     context.close.assert_called_once()
 
 
+def _real_hold_context(monkeypatch):
+    """A context mock whose hold bookkeeping is BaseCacheContext's own."""
+    # Third Party
+    import torch
+
+    # First Party
+    from lmcache.v1.platform.base.cache_context import BaseCacheContext
+
+    context = MagicMock(name="context")
+    context.device = torch.device("cuda", 0)
+    context.stream = _NeverQueryStream(drained=True)
+    context._held_imports = {}
+    context._held_import_times = {}
+    context._held_imports_lock = threading.Lock()
+    for name in ("hold_imported_event", "release_imported_event"):
+        method = getattr(BaseCacheContext, name)
+        setattr(context, name, lambda *a, _m=method: _m(context, *a))
+    context.held_imports_snapshot = lambda: BaseCacheContext.held_imports_snapshot(
+        context
+    )
+    monkeypatch.setattr(gpu_mod, "create_cache_context", lambda *a, **kw: context)
+    monkeypatch.setattr(gpu_mod, "get_event_ipc_backend", lambda d: _LegacyBackend())
+    monkeypatch.setattr(gpu_mod, "get_layout_desc", lambda *a, **kw: MagicMock())
+    return context
+
+
+def test_callback_between_registry_pop_and_pending_insert_is_not_lost(
+    monkeypatch, clock, dev
+) -> None:
+    """A release callback landing while UNREGISTER has popped the entry but not
+    queued its pending release yet must still drop the hold; otherwise an idle
+    stream would look busy forever (forced, poisoned, then stuck)."""
+    module = _module(monkeypatch)
+    context = _real_hold_context(monkeypatch)
+    module.register_kv_cache(1, MagicMock(), "m", 1, MagicMock(), MagicMock(), [])
+    token = context.hold_imported_event("event")
+    module._ctx.layout_desc_registry.unregister.side_effect = lambda *a: (
+        module._release_imported_event((1, token))
+    )
+
+    module.unregister_kv_cache(1)
+
+    assert context.held_imports_snapshot() == ([], None)
+    context.close.assert_called_once()
+    status = module.release_status()
+    assert status["pending_instance_ids"] == [] and status["forced"] == 0
+
+
 def test_close_keeps_dispatching_callbacks_until_releases_ran(
     monkeypatch, clock, dev
 ) -> None:
@@ -900,6 +948,7 @@ def test_force_complete_events_writes_max_seq_per_slot(monkeypatch) -> None:
         ts, "_cuda", SimpleNamespace(driver=fake_driver, runtime=fake_runtime)
     )
     monkeypatch.setattr(ts, "_CHECK_CUDA", lambda result, what: None)
+    monkeypatch.setattr(ts, "_nogil_driver", lambda: None)  # cuda-python path
     monkeypatch.setattr(ts, "_raw_stream_handle", lambda stream, device: 7)
     monkeypatch.setattr(ts.torch.cuda, "device", lambda index: nullcontext())
     monkeypatch.setattr(ts, "_LOCAL_BUFFERS_BY_HANDLE", {b"own": 0x9000})
@@ -907,10 +956,12 @@ def test_force_complete_events_writes_max_seq_per_slot(monkeypatch) -> None:
     monkeypatch.setattr(
         backend, "_get_buffer", lambda index: SimpleNamespace(buffer_ops_stream="s")
     )
-    # Slot at 0x1008 already reached 9: it must not be moved backwards.
-    current = {0x1000: 0, 0x1008: 9}
+    # The slot is never read back (a D2H read can block next to a stuck
+    # stream): every slot with an awaited sequence is written.
     monkeypatch.setattr(
-        backend, "_read_slot", lambda e: current[e.base_ptr + e.slot_offset]
+        backend,
+        "_read_slot",
+        lambda e: pytest.fail("force must not read the slot back"),
     )
     local = ts.TimelineSemaphoreEvent(
         origin=ts.TimelineSemaphoreEventOrigin.LOCAL,
@@ -922,7 +973,7 @@ def test_force_complete_events_writes_max_seq_per_slot(monkeypatch) -> None:
     events = [
         _imported(0x1000, 0, 4),
         _imported(0x1000, 0, 6),  # same slot, higher seq wins
-        _imported(0x1000, 8, 5),  # already satisfied (slot is 9)
+        _imported(0x1000, 8, 5),  # another slot
         _imported(0x1000, 16, 0),  # never recorded
         _imported(0x9000, 0, 2),  # resolves to this process's own buffer
         local,
@@ -931,8 +982,58 @@ def test_force_complete_events_writes_max_seq_per_slot(monkeypatch) -> None:
 
     written = backend.force_complete_events(events)
 
-    assert writes == [(0x1000, 6)]
-    assert written == 1
+    assert writes == [(0x1000, 6), (0x1008, 5)]
+    assert written == 2
+
+
+class _FakeNoGil:
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def wait_value_geq(self, stream: int, address: int, value: int) -> None:
+        self.calls.append(("wait", stream, address, value))
+
+    def write_value(self, stream: int, address: int, value: int) -> None:
+        self.calls.append(("write", stream, address, value))
+
+    def synchronize(self, stream: int) -> None:
+        self.calls.append(("sync", stream))
+
+
+def test_stream_memory_ops_go_through_the_gil_free_driver(monkeypatch) -> None:
+    """wait/record/force use the ctypes driver (drops the GIL) when present,
+    never cuda-python, which keeps the GIL while a full stream blocks it."""
+    fake = _FakeNoGil()
+    monkeypatch.setattr(ts, "_nogil_driver", lambda: fake)
+    monkeypatch.setattr(
+        ts, "_cuda", SimpleNamespace(driver=None, runtime=None)
+    )  # any cuda-python use would raise
+    monkeypatch.setattr(ts, "_raw_stream_handle", lambda stream, device: 7)
+    monkeypatch.setattr(ts.torch.cuda, "device", lambda index: nullcontext())
+    monkeypatch.setattr(ts, "_LOCAL_BUFFERS_BY_HANDLE", {})
+    backend = ts.TimelineSemaphoreEventIPCBackend()
+    buffer = SimpleNamespace(
+        buffer_ops_stream="s",
+        lock=threading.Lock(),
+        base_ptr=0x2000,
+        handle_bytes=b"h",
+        assign_locked=lambda stream: (8, 3),
+    )
+    monkeypatch.setattr(backend, "_get_buffer", lambda index: buffer)
+
+    ts._enqueue_wait(_imported(0x1000, 0, 4), "stream")
+    local = ts.TimelineSemaphoreEvent(
+        origin=ts.TimelineSemaphoreEventOrigin.LOCAL, device_index=0
+    )
+    backend.record_event(local, "stream")
+    backend.force_complete_events([_imported(0x1000, 16, 9)])
+
+    assert fake.calls == [
+        ("wait", 7, 0x1000, 4),
+        ("write", 7, 0x2008, 3),
+        ("write", 7, 0x1010, 9),
+        ("sync", 7),
+    ]
 
 
 def test_concurrent_release_cycles_are_serialized(monkeypatch, clock, dev) -> None:

@@ -159,18 +159,18 @@ def test_store_owner_callback_round_trip(
                 err == L1Error.KEY_NOT_EXIST
                 for err, _ in manager.reserve_read(keys).values()
             )
-        # The imported producer event is released by a callback queued right
-        # behind the stream wait, before any copy.
-        release_kind, release_encoded = queued[0]
+        # The imported producer event is held for the whole section and
+        # released by its last queued op, after the copies and the commit.
+        release_kind, release_encoded = queued[-1]
         assert release_kind == "release_imported_event"
         assert msgspec.msgpack.decode(release_encoded, type=tuple[int, int]) == (1, 7)
         if failure != "none":
             assert len(queued) == 1
-            assert order == ["callback", "copy", "copy", "record"]
+            assert order == ["copy", "copy", "record", "callback"]
             assert all(obj.is_valid() for obj in copied)
         else:
-            assert order == ["callback", "copy", "copy", "record", "callback"]
-            kind, encoded = queued[1]
+            assert order == ["copy", "copy", "record", "callback", "callback"]
+            kind, encoded = queued[0]
             assert kind == "finish_write_unless_poisoned"
             generation, payload = msgspec.msgpack.decode(
                 encoded, type=tuple[int, L1WriteCompletion]

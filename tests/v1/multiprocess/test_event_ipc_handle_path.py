@@ -304,8 +304,9 @@ def test_server_store_and_retrieve_delegate_event_ordering(
     assert imported_handles == [b"store-producer", b"retrieve-producer"]
     assert waited_handles == [b"store-producer", b"retrieve-producer"]
 
-    # Each import is held and its release is queued on the transfer stream
-    # right behind the wait; the callback payload decodes as registered.
+    # Each import is held for its transfer section and its release is queued
+    # on the transfer stream as the section's last op; the callback payload
+    # decodes as registered.
     assert held == [("remote", handle) for handle in imported_handles]
     assert callbacks == [
         ("release_imported_event", (1, 0)),
