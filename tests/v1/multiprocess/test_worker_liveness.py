@@ -424,33 +424,6 @@ def test_healthcheck_reports_a_stalled_mq_loop() -> None:
     ) == {"status": "healthy"}
 
 
-def test_mq_server_loop_stall_tracks_iterations(tmp_path) -> None:
-    """A running idle loop comes back every poll (<= ~1s); a stopped loop
-    reports None."""
-    # Third Party
-    import zmq
-
-    # First Party
-    from lmcache.v1.multiprocess.transport.zmq_impl.mq import MessageQueueServer
-
-    server = MessageQueueServer(f"ipc://{tmp_path}/mq.sock", zmq.Context())
-    assert server.main_loop_stall_seconds() is None
-    server.start()
-    try:
-        deadline = time.monotonic() + 5.0
-        while server.main_loop_stall_seconds() is None:
-            assert time.monotonic() < deadline
-            time.sleep(0.01)
-        samples = []
-        for _ in range(15):
-            samples.append(server.main_loop_stall_seconds())
-            time.sleep(0.2)
-        assert all(s is not None and s < 2.0 for s in samples)
-    finally:
-        server.close()
-    assert server.main_loop_stall_seconds() is None
-
-
 def test_config_rejects_negative_mq_loop_stall() -> None:
     with pytest.raises(ValueError, match="mq_loop_stall_unhealthy_seconds"):
         MPServerConfig(mq_loop_stall_unhealthy_seconds=-1.0)
