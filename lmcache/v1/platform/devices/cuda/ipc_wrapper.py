@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import Callable, ClassVar
 import os
 import threading
+import time
 import uuid
 
 # Third Party
@@ -84,6 +85,15 @@ _VMM_MULTI_CHUNK_HINT = (
 # allocation is only ever imported on the wrapper's own device.
 _MAPPED_ALLOCATIONS: dict[bytes, list[int]] = {}
 _MAPPINGS_LOCK = threading.Lock()
+# Handles whose last reference was released and whose cudaIpcCloseMemHandle
+# is in progress, each with an event set when the unmap returns. The unmap
+# runs OUTSIDE _MAPPINGS_LOCK: it waits for the whole device to go idle, so a
+# stream stuck on a dead worker's event can hold it for minutes, and under the
+# lock that would block every registration on every GPU (each opens mappings
+# here). Re-opening a handle that is still closing waits for that close.
+_CLOSING_ALLOCATIONS: dict[bytes, threading.Event] = {}
+#: How long to_tensor waits for a closing mapping of the same allocation.
+_REOPEN_WAIT_SECONDS = 30.0
 
 
 @dataclass
@@ -395,21 +405,33 @@ class RawCudaIPCWrapper(DeviceIPCWrapper):
 
         device_index = self._get_device_index_from_uuid(self.device_uuid)
 
-        with _MAPPINGS_LOCK:
-            entry = _MAPPED_ALLOCATIONS.get(self._ipc_handle_reserved)
-            if entry is None:
-                handle = cuda_ipc_handle_from_bytes(self._ipc_handle_reserved)
-                with torch.cuda.device(device_index):
-                    err, ptr = _cuda.runtime.cudaIpcOpenMemHandle(
-                        handle, _cuda.runtime.cudaIpcMemLazyEnablePeerAccess
-                    )
-                if err != _cuda.runtime.cudaError_t.cudaSuccess:
-                    raise RuntimeError(f"cudaIpcOpenMemHandle failed: {err}")
-                entry = [int(ptr), 0]
-                _MAPPED_ALLOCATIONS[self._ipc_handle_reserved] = entry
-            entry[1] += 1
-            self._opens += 1
-            base_ptr = entry[0]
+        deadline = time.monotonic() + _REOPEN_WAIT_SECONDS
+        while True:
+            with _MAPPINGS_LOCK:
+                closing = _CLOSING_ALLOCATIONS.get(self._ipc_handle_reserved)
+                if closing is None:
+                    entry = _MAPPED_ALLOCATIONS.get(self._ipc_handle_reserved)
+                    if entry is None:
+                        handle = cuda_ipc_handle_from_bytes(self._ipc_handle_reserved)
+                        with torch.cuda.device(device_index):
+                            err, ptr = _cuda.runtime.cudaIpcOpenMemHandle(
+                                handle, _cuda.runtime.cudaIpcMemLazyEnablePeerAccess
+                            )
+                        if err != _cuda.runtime.cudaError_t.cudaSuccess:
+                            raise RuntimeError(f"cudaIpcOpenMemHandle failed: {err}")
+                        entry = [int(ptr), 0]
+                        _MAPPED_ALLOCATIONS[self._ipc_handle_reserved] = entry
+                    entry[1] += 1
+                    self._opens += 1
+                    base_ptr = entry[0]
+                    break
+            # The driver keeps one mapping per allocation: opening it now
+            # would hand back the address the pending close is about to unmap.
+            if not closing.wait(max(0.0, deadline - time.monotonic())):
+                raise RuntimeError(
+                    "cudaIpcOpenMemHandle: the previous mapping of this "
+                    "allocation is still being closed; retry the registration"
+                )
 
         # Wrap as a flat ``uint8`` CuPy array at the allocation offset,
         # DLPack to torch, then view as the original dtype/shape.
@@ -452,6 +474,9 @@ class RawCudaIPCWrapper(DeviceIPCWrapper):
             if entry[1] > 0:
                 return
             del _MAPPED_ALLOCATIONS[self._ipc_handle_reserved]
+            done = threading.Event()
+            _CLOSING_ALLOCATIONS[self._ipc_handle_reserved] = done
+        try:
             device_index = self._get_device_index_from_uuid(self.device_uuid)
             with torch.cuda.device(device_index):
                 (err,) = _cuda.runtime.cudaIpcCloseMemHandle(entry[0])
@@ -459,6 +484,10 @@ class RawCudaIPCWrapper(DeviceIPCWrapper):
                 logger.warning(
                     "cudaIpcCloseMemHandle failed: %s (ptr=0x%x)", err, entry[0]
                 )
+        finally:
+            with _MAPPINGS_LOCK:
+                del _CLOSING_ALLOCATIONS[self._ipc_handle_reserved]
+            done.set()
 
 
 class VmmCudaIPCWrapper(DeviceIPCWrapper):

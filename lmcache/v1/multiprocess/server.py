@@ -232,6 +232,7 @@ def _build_server_components(
         drain_grace_seconds=mp_config.ipc_release_drain_grace_seconds,
         stuck_timeout_seconds=mp_config.ipc_release_stuck_timeout_seconds,
         stuck_action=mp_config.ipc_release_stuck_action,
+        stale_wait_seconds=mp_config.ipc_release_stale_wait_seconds,
     )
     if mp_config.supported_transfer_mode == "lmcache_driven":
         transfer_modules.append(LMCacheDrivenTransferModule(ctx, release_config))

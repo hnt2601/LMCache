@@ -45,10 +45,24 @@ class _FakeTorchDev:
             )
 
 
+def _inline_release_thread(name, interval, execute_fn, level=None, **_):
+    """Release thread stand-in: wake() runs one release cycle right away."""
+    return SimpleNamespace(
+        start=lambda: None, stop=lambda *a, **k: None, wake=lambda: execute_fn()
+    )
+
+
 def _module(monkeypatch) -> LMCacheDrivenTransferModule:
-    """Construct the module through the real __init__ with stubbed deps."""
+    """Construct the module through the real __init__ with stubbed deps.
+
+    Releases are asynchronous (release thread + unmapper thread); both are
+    made synchronous here so each call below completes its release inline.
+    """
     monkeypatch.setattr(gpu_mod, "DeviceHostFuncDispatcher", MagicMock())
-    return LMCacheDrivenTransferModule(MagicMock(name="ctx"))
+    monkeypatch.setattr(gpu_mod, "create_periodic_thread", _inline_release_thread)
+    module = LMCacheDrivenTransferModule(MagicMock(name="ctx"))
+    module._submit_unmap = module._finalize_releases
+    return module
 
 
 def _register(

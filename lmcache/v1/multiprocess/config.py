@@ -145,6 +145,11 @@ class MPServerConfig:
     """How long a stream may stay busy after forcing before the release counts
     as stuck and ipc_release_stuck_action applies."""
 
+    ipc_release_stale_wait_seconds: float = 10.0
+    """A wait pending longer than this on a registered worker marks its GPU as
+    having a stuck stream; nothing is unmapped on that GPU until it clears
+    (unmapping next to a stuck stream blocks until the stream drains)."""
+
     ipc_release_stuck_action: Literal["quarantine", "exit"] = "quarantine"
     """What to do with a stuck release: 'quarantine' keeps its KV mappings
     held and reports it in /status; 'exit' terminates the server so the
@@ -190,6 +195,7 @@ class MPServerConfig:
         for name in (
             "ipc_release_drain_grace_seconds",
             "ipc_release_stuck_timeout_seconds",
+            "ipc_release_stale_wait_seconds",
         ):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
@@ -568,6 +574,14 @@ def add_mp_server_args(
         "release counts as stuck. Default is 60.",
     )
     mp_group.add_argument(
+        "--ipc-release-stale-wait-seconds",
+        type=float,
+        default=10.0,
+        help="A wait pending longer than this (s) on a registered worker marks "
+        "its GPU as having a stuck stream; nothing is unmapped on that GPU "
+        "until it clears. Default is 10.",
+    )
+    mp_group.add_argument(
         "--ipc-release-stuck-action",
         choices=["quarantine", "exit"],
         default="quarantine",
@@ -668,6 +682,7 @@ def parse_args_to_mp_server_config(
         worker_registration_grace_seconds=args.worker_registration_grace_seconds,
         ipc_release_drain_grace_seconds=args.ipc_release_drain_grace_seconds,
         ipc_release_stuck_timeout_seconds=args.ipc_release_stuck_timeout_seconds,
+        ipc_release_stale_wait_seconds=args.ipc_release_stale_wait_seconds,
         ipc_release_stuck_action=args.ipc_release_stuck_action,
         enable=args.enable or [],
         server_modules=parse_server_module_specs(args.server_module or []),

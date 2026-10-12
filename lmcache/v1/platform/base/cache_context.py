@@ -15,6 +15,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, ClassVar
 import array
+import itertools
 import threading
 import time
 
@@ -33,6 +34,10 @@ if TYPE_CHECKING:
     # First Party
     from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
     from lmcache.v1.platform.ops_types import PageBufferShapeDesc
+
+
+#: Source of import tokens; see BaseCacheContext.hold_imported_event.
+_IMPORT_TOKENS = itertools.count()
 
 
 class BaseCacheContext(ABC):
@@ -75,7 +80,6 @@ class BaseCacheContext(ABC):
         # time.monotonic() at hold, by token; lets teardown tell how long the
         # oldest queued wait has been pending (see held_imports_snapshot).
         self._held_import_times: dict[int, float] = {}
-        self._next_import_token = 0
         self._held_imports_lock = threading.Lock()
 
     def hold_imported_event(self, event: object) -> int:
@@ -92,8 +96,10 @@ class BaseCacheContext(ABC):
             The token that releases this import.
         """
         with self._held_imports_lock:
-            token = self._next_import_token
-            self._next_import_token += 1
+            # Process-unique, not per-context: a release callback queued by an
+            # earlier registration of the same instance ID must not pop a hold
+            # of its re-registered successor.
+            token = next(_IMPORT_TOKENS)
             self._held_imports[token] = event
             self._held_import_times[token] = time.monotonic()
             return token

@@ -105,10 +105,35 @@ def dev(monkeypatch) -> MagicMock:
     return fake
 
 
+class _Thread:
+    """Release thread stand-in: records start, and wake() runs one cycle."""
+
+    def __init__(self, execute_fn) -> None:
+        self.execute_fn = execute_fn
+        self.started = 0
+
+    def start(self) -> None:
+        self.started += 1
+
+    def stop(self, *args, **kwargs) -> None:
+        pass
+
+    def wake(self) -> None:
+        self.execute_fn()
+
+
 def _module(monkeypatch, **cfg) -> LMCacheDrivenTransferModule:
     monkeypatch.setattr(gpu_mod, "DeviceHostFuncDispatcher", MagicMock())
-    # The release thread is stepped by hand through _release_cycle().
-    monkeypatch.setattr(gpu_mod, "create_periodic_thread", MagicMock())
+    # Releases run on the release thread and unmaps on the unmapper thread;
+    # here wake() runs one cycle inline and unmaps run inline, and further
+    # cycles are stepped by hand through _release_cycle().
+    threads: list[_Thread] = []
+
+    def make_thread(name, interval, execute_fn, level=None, **_):
+        threads.append(_Thread(execute_fn))
+        return threads[-1]
+
+    monkeypatch.setattr(gpu_mod, "create_periodic_thread", make_thread)
     config = IPCReleaseConfig(
         drain_grace_seconds=cfg.get("grace", 30.0),
         stuck_timeout_seconds=cfg.get("stuck", 60.0),
@@ -116,7 +141,10 @@ def _module(monkeypatch, **cfg) -> LMCacheDrivenTransferModule:
         poll_interval_seconds=1.0,
         max_force_wait_age_seconds=cfg.get("max_age", 300.0),
     )
-    return LMCacheDrivenTransferModule(MagicMock(name="ctx"), config)
+    module = LMCacheDrivenTransferModule(MagicMock(name="ctx"), config)
+    module._submit_unmap = module._finalize_releases
+    module._test_threads = threads
+    return module
 
 
 def _register(
@@ -168,7 +196,9 @@ def test_drained_stream_is_unmapped_inline(monkeypatch, clock, dev) -> None:
     ctx.close.assert_called_once()
     dev.empty_cache.assert_called_once()
     assert module.release_status()["pending_instance_ids"] == []
-    gpu_mod.create_periodic_thread.assert_not_called()
+    # Even a drained release is unmapped by the release path, never by the
+    # caller (the MQ loop): one release thread was started for it.
+    assert [t.started for t in module._test_threads] == [1]
 
 
 def test_busy_stream_is_deferred_not_closed(monkeypatch, clock, dev) -> None:
@@ -182,7 +212,7 @@ def test_busy_stream_is_deferred_not_closed(monkeypatch, clock, dev) -> None:
     ctx.close.assert_not_called()
     dev.empty_cache.assert_not_called()
     assert module.release_status()["pending_instance_ids"] == [1]
-    gpu_mod.create_periodic_thread.return_value.start.assert_called_once()
+    assert [t.started for t in module._test_threads] == [1]
 
     stream.drained = True
     module._release_cycle()
@@ -342,9 +372,9 @@ def test_poison_expires_after_release(monkeypatch, clock, dev) -> None:
 
 
 def test_busy_release_blocks_unmaps_on_its_device_only(monkeypatch, clock, dev) -> None:
-    """Freeing or unmapping next to a stream that never drains can block, so a
-    busy release holds back other releases on the same device, but not on
-    another device; and empty_cache waits until nothing is pending."""
+    """Unmapping next to a stream that never drains blocks until it drains,
+    so a busy release holds back other releases on the same device, but not
+    on another device; and empty_cache waits until nothing is pending."""
     module = _module(monkeypatch, grace=1000.0)
     stuck = _Stream(drained=False)
     _register(module, monkeypatch, clock, 1, stuck, _LegacyBackend(), "cuda:0")
@@ -358,18 +388,73 @@ def test_busy_release_blocks_unmaps_on_its_device_only(monkeypatch, clock, dev) 
     ctx_other = _register(
         module, monkeypatch, clock, 3, other, _LegacyBackend(), "cuda:1"
     )
-    module.unregister_kv_cache(2)  # deferred: a release is already pending
+    module.unregister_kv_cache(2)
     module.unregister_kv_cache(3)
-    ctx_same.close.assert_not_called()
-    ctx_other.close.assert_not_called()
-
     module._release_cycle()
 
     ctx_same.close.assert_not_called()  # held back by the busy cuda:0 stream
     ctx_other.close.assert_called_once()
     dev.empty_cache.assert_not_called()
     dev.ipc_collect.assert_called()
-    assert sorted(module.release_status()["pending_instance_ids"]) == [1, 2]
+    status = module.release_status()
+    assert sorted(status["pending_instance_ids"]) == [1, 2]
+    assert status["held_back_instance_ids"] == [2]
+
+    stuck.drained = True
+    module._release_cycle()
+    ctx_same.close.assert_called_once()
+
+
+def test_stale_wait_on_registered_instance_blocks_its_device(
+    monkeypatch, clock, dev
+) -> None:
+    """A dead worker that is not reaped yet already has a stuck stream; a
+    release on the same GPU must wait, one on another GPU must not."""
+    module = _module(monkeypatch)
+    dead = _Stream(drained=False)
+    ctx_dead = _register(
+        module, monkeypatch, clock, 1, dead, _LegacyBackend(), "cuda:0"
+    )
+    ctx_dead.held_imports_snapshot.return_value = (["e"], clock.now)
+    clock.now += 11.0  # past stale_wait_seconds (10s default)
+
+    same = _Stream(drained=True)
+    ctx_same = _register(
+        module, monkeypatch, clock, 2, same, _LegacyBackend(), "cuda:0"
+    )
+    other = _Stream(drained=True)
+    ctx_other = _register(
+        module, monkeypatch, clock, 3, other, _LegacyBackend(), "cuda:1"
+    )
+    module.unregister_kv_cache(2)
+    module.unregister_kv_cache(3)
+
+    ctx_same.close.assert_not_called()
+    ctx_other.close.assert_called_once()
+    dev.empty_cache.assert_not_called()  # a stale wait exists somewhere
+
+    dead.drained = True  # e.g. the worker was reaped and forced
+    module._release_cycle()
+    ctx_same.close.assert_called_once()
+
+
+def test_unregister_never_unmaps_on_the_caller_thread(monkeypatch, clock, dev) -> None:
+    """With a real (not inline) unmapper, UNREGISTER returns before the unmap,
+    which runs on the lmcache-mp-ipc-unmap thread."""
+    module = _module(monkeypatch)
+    del module._submit_unmap  # restore the real thread-backed unmapper
+    stream = _Stream(drained=True)
+    ctx = _register(module, monkeypatch, clock, 1, stream, _LegacyBackend())
+    closed_on: list[str] = []
+    ctx.close.side_effect = lambda: closed_on.append(threading.current_thread().name)
+
+    module.unregister_kv_cache(1)
+    deadline = time.monotonic() + 5
+    while not closed_on and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert closed_on == ["lmcache-mp-ipc-unmap"]
+    module._unmap_queue.put(None)
 
 
 # --------------------------------------------------------------- stuck path --
