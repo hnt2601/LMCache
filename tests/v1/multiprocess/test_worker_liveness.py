@@ -118,9 +118,9 @@ def test_gpu_touch_latches_get_does_not() -> None:
     assert module._cache_contexts[1].last_seen > 0.0
     assert module._cache_contexts[1].has_liveness_signal is False
 
-    module.touch_instance(1)
+    assert module.touch_instance(1) is True
     assert module._cache_contexts[1].has_liveness_signal is True
-    module.touch_instance(999)  # absent -> no error
+    assert module.touch_instance(999) is False  # absent -> no error, untracked
 
 
 def test_gpu_reap_two_tier_windows() -> None:
@@ -206,8 +206,11 @@ class _FakeTarget:
         self.dropped: list[int] = []
         self.count = 0
 
-    def touch_instance(self, instance_id: int) -> None:
+    def touch_instance(self, instance_id: int) -> bool | None:
         self.touched.append(instance_id)
+        return self.tracks
+
+    tracks: bool | None = True
 
     def reap_stale_instances(
         self, reap_timeout_s: float, registration_grace_s: float
@@ -236,9 +239,36 @@ def test_management_ping_touches_targets() -> None:
     target = _FakeTarget()
     mgmt = ManagementModule(MagicMock(), liveness_targets=[target])
 
-    assert mgmt.ping(42) is True
-    assert mgmt.ping(None) is True
+    token = mgmt.ping(42)
+    assert isinstance(token, int) and token >= 2
+    assert mgmt.ping(None) == token
     assert target.touched == [42]
+
+
+def test_management_ping_boot_token_is_per_process() -> None:
+    a = ManagementModule(MagicMock(), liveness_targets=[_FakeTarget()])
+    b = ManagementModule(MagicMock(), liveness_targets=[_FakeTarget()])
+    assert a.ping(None) == a.ping(None)
+    assert a.ping(None) != b.ping(None)
+
+
+def test_management_ping_negates_token_for_untracked_instance() -> None:
+    """Negative only when every target says it does not track the instance;
+    a target without liveness state (None) never triggers re-registration."""
+    tracked, untracked, stateless = _FakeTarget(), _FakeTarget(), _FakeTarget()
+    untracked.tracks = False
+    stateless.tracks = None
+    token = ManagementModule(MagicMock(), liveness_targets=[untracked]).ping(None)
+    assert token > 0
+
+    only_untracked = ManagementModule(MagicMock(), liveness_targets=[untracked])
+    assert only_untracked.ping(5) == -only_untracked.ping(None)
+    mixed = ManagementModule(MagicMock(), liveness_targets=[untracked, tracked])
+    assert mixed.ping(5) > 0
+    with_stateless = ManagementModule(
+        MagicMock(), liveness_targets=[untracked, stateless]
+    )
+    assert with_stateless.ping(5) > 0
 
 
 def test_management_clear_defaults_to_non_force() -> None:
@@ -286,7 +316,7 @@ def test_management_reaper_disabled_when_timeout_zero() -> None:
         worker_reap_timeout_seconds=0.0,
     )
     assert mgmt._reaper is None
-    assert mgmt.ping(1) is True
+    assert mgmt.ping(1) > 0
 
 
 def test_management_report_status_summarizes_liveness() -> None:

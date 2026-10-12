@@ -86,6 +86,32 @@ _SPECIAL_ENCODER_DECODERS = {
 }
 
 
+# TCP keepalive for every DEALER/ROUTER socket. A peer that dies without a
+# FIN/RST (a pod killed ungracefully, or an idle connection's Kubernetes
+# Service/conntrack entry dropped) is otherwise invisible until a send, which
+# then waits out the kernel's retransmission backoff (tens of minutes) rather
+# than any of this module's timeouts. Keepalive probes idle connections so a
+# dead peer is detected in bounded time.
+_TCP_KEEPALIVE_IDLE_SECONDS = 30
+_TCP_KEEPALIVE_INTERVAL_SECONDS = 10
+_TCP_KEEPALIVE_PROBES = 3
+
+
+def _enable_tcp_keepalive(socket: zmq.Socket) -> None:
+    """Enable TCP keepalive probing on a DEALER/ROUTER socket.
+
+    Must be set before ``connect()``/``bind()`` to apply to the connections
+    made by it.
+
+    Args:
+        socket: The ZMQ socket to configure.
+    """
+    socket.setsockopt(zmq.TCP_KEEPALIVE, 1)
+    socket.setsockopt(zmq.TCP_KEEPALIVE_IDLE, _TCP_KEEPALIVE_IDLE_SECONDS)
+    socket.setsockopt(zmq.TCP_KEEPALIVE_INTVL, _TCP_KEEPALIVE_INTERVAL_SECONDS)
+    socket.setsockopt(zmq.TCP_KEEPALIVE_CNT, _TCP_KEEPALIVE_PROBES)
+
+
 def msgspec_encode(obj: Any, cls: Any) -> bytes:
     # Handle special cases
     if cls in _SPECIAL_ENCODER_DECODERS:
@@ -289,6 +315,7 @@ class MessageQueueClient:
         # Socket
         self.ctx = context
         self.socket = self.ctx.socket(zmq.DEALER)
+        _enable_tcp_keepalive(self.socket)
         self.socket.setsockopt(zmq.CONNECT_TIMEOUT, CONNECT_TIMEOUT_MS)
         self.socket.setsockopt(zmq.RECONNECT_IVL_MAX, RECONNECT_IVL_MAX_MS)
         self.socket.connect(server_url)
@@ -523,6 +550,7 @@ class MessageQueueServer(RequestServer):
         # Socket
         self.ctx = context
         self.socket = self.ctx.socket(zmq.ROUTER)
+        _enable_tcp_keepalive(self.socket)
         self.socket.bind(bind_url)
         # Use a cross-platform Notifier instead of zmq PUSH/PULL sockets
         # because blocking handler callbacks run on ThreadPoolExecutor

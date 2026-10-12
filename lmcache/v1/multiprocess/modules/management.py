@@ -3,6 +3,7 @@
 
 # Standard
 from collections.abc import Sequence
+import secrets
 import threading
 
 # First Party
@@ -59,6 +60,13 @@ class ManagementModule:
         self._reap_grace = worker_registration_grace_seconds
         self._experimental_transfer = tuple(experimental_transfer)
 
+        # Per-process random boot token, returned by ping() so a client can
+        # detect a server restart even when ZMQ's DEALER socket hides it by
+        # reconnecting to the same endpoint (PINGs before and after succeed).
+        # Range [2, 2**63 - 1]: 0 and 1 are reserved, so a legacy server's
+        # bool ``True`` (decoded as int 1) never equals a real token.
+        self._boot_token: int = secrets.randbelow(2**63 - 2) + 2
+
         # Periodic reaper, started only when reaping is enabled and there is
         # something to scan. Scans every reap_timeout/4, so an instance is
         # reaped between timeout and timeout + interval after its last signal.
@@ -103,7 +111,7 @@ class ManagementModule:
             self._reaper.stop()
 
     @request_handler(HandlerType.BLOCKING)
-    def ping(self, instance_id: int | None) -> bool:
+    def ping(self, instance_id: int | None) -> int:
         """Respond to a ping and refresh the sender's liveness.
 
         Args:
@@ -112,12 +120,22 @@ class ManagementModule:
                 worker's last-seen time is refreshed on every liveness target.
 
         Returns:
-            Always True.
+            This process's boot token: a positive int, stable for the
+            server's lifetime and new on every restart, so a client comparing
+            successive tokens detects a restart even when both PINGs
+            succeeded. Negated when ``instance_id`` is given and no liveness
+            target tracks it (never registered, or reaped): the worker is
+            alive but unknown here and must re-register.
         """
-        if instance_id is not None:
-            for target in self._liveness_targets:
-                target.touch_instance(instance_id)
-        return True
+        if instance_id is not None and self._liveness_targets:
+            # A target answering None (no tracking info) counts as tracking,
+            # so an unknown target can never trigger re-registration storms.
+            tracked = [
+                target.touch_instance(instance_id) for target in self._liveness_targets
+            ]
+            if all(t is False for t in tracked):
+                return -self._boot_token
+        return self._boot_token
 
     def _reap_cycle(self) -> ThreadRunSummary:
         """Run one reaper scan: reap stale workers, drop mirrored state.
