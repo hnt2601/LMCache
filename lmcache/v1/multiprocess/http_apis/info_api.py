@@ -46,6 +46,9 @@ async def healthcheck(request: Request) -> Any:
     Checks:
         - HTTP server is alive (implicit: if you get a response)
         - Cache engine is alive
+        - The request loop is not stuck (when
+          ``--mq-loop-stall-unhealthy-seconds`` is set and the transport
+          reports its loop progress)
     """
     engine = getattr(request.app.state, "engine", None)
     if engine is None:
@@ -56,6 +59,23 @@ async def healthcheck(request: Request) -> Any:
                 "reason": "engine not initialized",
             },
         )
+
+    limit = getattr(request.app.state, "mq_loop_stall_unhealthy_seconds", 0.0)
+    stall_fn = getattr(
+        getattr(request.app.state, "request_server", None),
+        "main_loop_stall_seconds",
+        None,
+    )
+    if isinstance(limit, (int, float)) and limit > 0 and callable(stall_fn):
+        stall = stall_fn()
+        if stall is not None and stall > limit:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "unhealthy",
+                    "reason": f"MQ main loop stalled for {stall:.0f}s",
+                },
+            )
 
     return {"status": "healthy"}
 

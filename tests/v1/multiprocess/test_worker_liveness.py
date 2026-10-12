@@ -8,6 +8,7 @@ are stubbed.
 """
 
 # Standard
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock
 import threading
@@ -377,3 +378,80 @@ def test_config_accepts_disabled_and_defaults() -> None:
     default = MPServerConfig()
     assert default.worker_reap_timeout_seconds == 120.0
     assert default.worker_registration_grace_seconds == 3600.0
+
+
+# ------------------------------------------------- MQ loop stall healthcheck --
+
+
+def _healthcheck(state: dict):
+    # Standard
+    import asyncio
+
+    # First Party
+    from lmcache.v1.multiprocess.http_apis.info_api import healthcheck
+
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(**state)))
+    return asyncio.run(healthcheck(request))
+
+
+def test_healthcheck_reports_a_stalled_mq_loop() -> None:
+    stalled = SimpleNamespace(main_loop_stall_seconds=lambda: 95.0)
+    base = {"engine": object(), "request_server": stalled}
+
+    response = _healthcheck({**base, "mq_loop_stall_unhealthy_seconds": 60.0})
+    assert response.status_code == 503
+    assert b"MQ main loop stalled for 95s" in response.body
+
+    assert _healthcheck({**base, "mq_loop_stall_unhealthy_seconds": 120.0}) == {
+        "status": "healthy"
+    }
+    # Disabled (default 0), unset, or a transport without loop tracking.
+    assert _healthcheck({**base, "mq_loop_stall_unhealthy_seconds": 0.0}) == {
+        "status": "healthy"
+    }
+    assert _healthcheck(base) == {"status": "healthy"}
+    no_tracking = {"engine": object(), "request_server": object()}
+    assert _healthcheck({**no_tracking, "mq_loop_stall_unhealthy_seconds": 1.0}) == {
+        "status": "healthy"
+    }
+    not_running = SimpleNamespace(main_loop_stall_seconds=lambda: None)
+    assert _healthcheck(
+        {
+            "engine": object(),
+            "request_server": not_running,
+            "mq_loop_stall_unhealthy_seconds": 1.0,
+        }
+    ) == {"status": "healthy"}
+
+
+def test_mq_server_loop_stall_tracks_iterations(tmp_path) -> None:
+    """A running idle loop comes back every poll (<= ~1s); a stopped loop
+    reports None."""
+    # Third Party
+    import zmq
+
+    # First Party
+    from lmcache.v1.multiprocess.transport.zmq_impl.mq import MessageQueueServer
+
+    server = MessageQueueServer(f"ipc://{tmp_path}/mq.sock", zmq.Context())
+    assert server.main_loop_stall_seconds() is None
+    server.start()
+    try:
+        deadline = time.monotonic() + 5.0
+        while server.main_loop_stall_seconds() is None:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        samples = []
+        for _ in range(15):
+            samples.append(server.main_loop_stall_seconds())
+            time.sleep(0.2)
+        assert all(s is not None and s < 2.0 for s in samples)
+    finally:
+        server.close()
+    assert server.main_loop_stall_seconds() is None
+
+
+def test_config_rejects_negative_mq_loop_stall() -> None:
+    with pytest.raises(ValueError, match="mq_loop_stall_unhealthy_seconds"):
+        MPServerConfig(mq_loop_stall_unhealthy_seconds=-1.0)
+    assert MPServerConfig().mq_loop_stall_unhealthy_seconds == 0.0

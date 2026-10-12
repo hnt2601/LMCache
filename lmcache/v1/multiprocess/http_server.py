@@ -112,6 +112,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state.request_server = request_server
     app.state.engine = engine
+    app.state.mq_loop_stall_unhealthy_seconds = (
+        mp_config.mq_loop_stall_unhealthy_seconds
+    )
     # Typed per-app context the cache handlers resolve via ``get_context``
     # (built now that the engine is ready).
     app.state.context = build_context(engine)

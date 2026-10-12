@@ -155,6 +155,12 @@ class MPServerConfig:
     held and reports it in /status; 'exit' terminates the server so the
     container restarts and the driver frees the memory."""
 
+    mq_loop_stall_unhealthy_seconds: float = 0.0
+    """Report /healthcheck unhealthy (503) once the MQ main loop has been stuck
+    in one iteration longer than this, so a liveness probe restarts a server
+    whose request loop hangs (for example behind a stuck GPU stream). Must
+    exceed the slowest REGISTER. 0 disables the check."""
+
     enable: list[str] = field(default_factory=list)
     """List of experimental transfer modules to enable. Options: transfer_query
     (see lmcache.v1.multiprocess.modules.experimental.__init___.py)."""
@@ -200,6 +206,12 @@ class MPServerConfig:
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be a positive number; got {value}")
+        stall = self.mq_loop_stall_unhealthy_seconds
+        if not math.isfinite(stall) or stall < 0:
+            raise ValueError(
+                "mq_loop_stall_unhealthy_seconds must be a non-negative number; "
+                f"got {stall}"
+            )
         if self.ipc_release_stuck_action not in ("quarantine", "exit"):
             raise ValueError(
                 "ipc_release_stuck_action must be 'quarantine' or 'exit'; got "
@@ -590,6 +602,15 @@ def add_mp_server_args(
         "server so its restart frees the GPU memory. Default is quarantine.",
     )
     mp_group.add_argument(
+        "--mq-loop-stall-unhealthy-seconds",
+        type=float,
+        default=0.0,
+        help="Report /healthcheck unhealthy once the MQ main loop has been "
+        "stuck in one iteration longer than this (s), so a liveness probe "
+        "restarts a hung server. Must exceed the slowest REGISTER. Default 0 "
+        "(disabled).",
+    )
+    mp_group.add_argument(
         "--enable-segmented-prefix",
         action="store_true",
         help="CacheBlend (--engine-type blend) only: on a mid-prefix L2 "
@@ -684,6 +705,7 @@ def parse_args_to_mp_server_config(
         ipc_release_stuck_timeout_seconds=args.ipc_release_stuck_timeout_seconds,
         ipc_release_stale_wait_seconds=args.ipc_release_stale_wait_seconds,
         ipc_release_stuck_action=args.ipc_release_stuck_action,
+        mq_loop_stall_unhealthy_seconds=args.mq_loop_stall_unhealthy_seconds,
         enable=args.enable or [],
         server_modules=parse_server_module_specs(args.server_module or []),
     )

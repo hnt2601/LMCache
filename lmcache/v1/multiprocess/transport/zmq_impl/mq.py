@@ -10,6 +10,7 @@ import inspect
 import itertools
 import queue
 import threading
+import time
 
 # Third Party
 import msgspec
@@ -569,6 +570,9 @@ class MessageQueueServer(RequestServer):
         self.worker_thread = threading.Thread(
             target=self._main_loop, daemon=True, name="mq-server-thread"
         )
+        # time.monotonic() at the top of the latest main-loop iteration, None
+        # while the loop is not running; see main_loop_stall_seconds.
+        self._loop_beat: float | None = None
 
         # Registered handlers: operation -> decoded handler wrapper
         self.handlers: dict[RpcOperation, RequestHandlerBase[Any]] = {}
@@ -654,9 +658,27 @@ class MessageQueueServer(RequestServer):
             case _:
                 raise ValueError("Unknown handler type")
 
+    def main_loop_stall_seconds(self) -> float | None:
+        """Return how long the main loop has been inside one iteration.
+
+        An idle loop comes back every poll timeout (1s), so a large value
+        means a handler running on the loop (SYNC handlers such as
+        REGISTER_KV_CACHE) is blocked, or the loop thread died. Every
+        request needing the loop stalls meanwhile.
+
+        Returns:
+            Seconds since the current iteration started, or None when the
+            loop is not running.
+        """
+        beat = self._loop_beat
+        if beat is None:
+            return None
+        return max(0.0, time.monotonic() - beat)
+
     def _main_loop(self):
         output_fd = self._output_efd.fileno()
         while not self.is_finished.is_set():
+            self._loop_beat = time.monotonic()
             socks = dict(self.poller.poll(1000))
             inbound_state = socks.get(self.socket, None)
             outbound_state = socks.get(output_fd, None)
@@ -700,6 +722,7 @@ class MessageQueueServer(RequestServer):
                         self.socket.send_multipart(frames_to_send)
                 except queue.Empty:
                     pass
+        self._loop_beat = None
 
     def _inspect_handler_signature(
         self, rpc_spec: RpcSpec, handler: Callable[..., Any]
