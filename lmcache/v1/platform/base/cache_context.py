@@ -79,6 +79,40 @@ def close_wrappers_after_failed_init(wrappers: list[Any], device_key: str) -> No
             logger.warning("KV wrapper close failed", exc_info=True)
 
 
+#: Optional check run before each device allocation of a context
+#: construction: ``guard(device, nbytes)``, raising to refuse it. Held weakly.
+#: The MP server installs one because a failed cudaMalloc makes the caching
+#: allocator cudaFree its cached blocks, which blocks behind a stuck stream on
+#: the device -- on the MQ loop, for every worker on the node.
+_device_alloc_guard: "weakref.WeakMethod | None" = None
+
+
+def set_device_alloc_guard(guard: Any | None) -> None:
+    """Install (or clear, with None) the device allocation guard.
+
+    Args:
+        guard: A bound method ``guard(device, nbytes)``, or None.
+    """
+    global _device_alloc_guard
+    _device_alloc_guard = weakref.WeakMethod(guard) if guard is not None else None
+
+
+def check_device_alloc(device: torch.device, nbytes: int) -> None:
+    """Run the installed allocation guard, if any, before allocating.
+
+    Args:
+        device: The device about to be allocated on.
+        nbytes: The requested size in bytes.
+
+    Raises:
+        Whatever the guard raises to refuse the allocation.
+    """
+    ref = _device_alloc_guard  # read once: close() may clear it concurrently
+    guard = ref() if ref is not None else None
+    if guard is not None:
+        guard(device, nbytes)
+
+
 #: Source of import tokens; see BaseCacheContext.hold_imported_event.
 _IMPORT_TOKENS = itertools.count()
 

@@ -546,6 +546,123 @@ def test_failed_registration_rollback_runs_off_the_caller(monkeypatch, clock) ->
     inline.close.assert_called_once()
 
 
+def test_failed_registration_after_construction_unmaps_context(
+    monkeypatch, clock, dev
+) -> None:
+    """A REGISTER failing after the context mapped the worker's KV pool (here:
+    event support check) hands the context to the unmapper, not the registry."""
+    module = _module(monkeypatch)
+    backend = _LegacyBackend()
+    backend.check_event_support = MagicMock(side_effect=RuntimeError("no events"))
+    with pytest.raises(RuntimeError, match="no events"):
+        _register(module, monkeypatch, clock, 1, _Stream(drained=True), backend)
+
+    ctx = gpu_mod.create_cache_context()
+    ctx.close.assert_called_once()
+    assert module.tracked_instance_count() == 0
+
+
+# ---------------------------------------------------------- allocation guard --
+
+_MIB = 1 << 20
+
+
+def test_allocator_segment_bytes_mirrors_caching_allocator() -> None:
+    seg = gpu_mod._allocator_segment_bytes
+    assert seg(8) == 2 * _MIB
+    assert seg(_MIB) == 2 * _MIB
+    assert seg(_MIB + 1) == 20 * _MIB
+    assert seg(8 * _MIB) == 20 * _MIB
+    assert seg(10 * _MIB) == 10 * _MIB
+    assert seg(10 * _MIB + 1) == 12 * _MIB
+    assert seg(300 * _MIB) == 300 * _MIB
+
+
+def _cuda(index: int):
+    # Third Party
+    import torch
+
+    return torch.device("cuda", index)
+
+
+def test_alloc_guard_allows_when_a_segment_fits(monkeypatch, clock, dev) -> None:
+    module = _module(monkeypatch)
+    dead = _Stream(drained=False)
+    ctx = _register(module, monkeypatch, clock, 1, dead, _LegacyBackend())
+    ctx.held_imports_snapshot.return_value = (["e"], clock.now - 60.0)
+    dev.mem_get_info.return_value = (20 * _MIB + 64 * _MIB, 80 << 30)
+
+    module._check_device_alloc(_cuda(0), 8 * _MIB)  # 20 MiB segment + margin fits
+
+    dev.mem_get_info.return_value = (80 * _MIB, 80 << 30)
+    with pytest.raises(RuntimeError, match="Refusing to allocate"):
+        module._check_device_alloc(_cuda(0), 8 * _MIB)
+    assert module.release_status()["alloc_refused"] == 1
+
+
+def test_alloc_guard_refuses_next_to_a_stuck_wait_only_on_its_device(
+    monkeypatch, clock, dev
+) -> None:
+    """Low memory + a registered instance with a wait pending past the guard
+    age on the same device: refuse. Another device, or a fresh wait: allow."""
+    module = _module(monkeypatch)
+    dead = _Stream(drained=False)
+    ctx = _register(module, monkeypatch, clock, 1, dead, _LegacyBackend(), "cuda:0")
+    dev.mem_get_info.return_value = (10 * _MIB, 80 << 30)
+
+    ctx.held_imports_snapshot.return_value = (["e"], clock.now - 0.5)
+    module._check_device_alloc(_cuda(0), 8 * _MIB)  # live wait: allowed
+
+    ctx.held_imports_snapshot.return_value = (["e"], clock.now - 2.0)
+    with pytest.raises(RuntimeError, match=r"instance\(s\) \[1\] have a wait"):
+        module._check_device_alloc(_cuda(0), 8 * _MIB)
+    module._check_device_alloc(_cuda(1), 8 * _MIB)  # other GPU unaffected
+
+    dead.drained = True  # the wait completed
+    module._check_device_alloc(_cuda(0), 8 * _MIB)
+    assert module.release_status()["alloc_refused"] == 1
+
+
+def test_alloc_guard_refuses_next_to_an_undrained_release(
+    monkeypatch, clock, dev
+) -> None:
+    module = _module(monkeypatch)
+    busy = _Stream(drained=False)
+    _register(module, monkeypatch, clock, 1, busy, _LegacyBackend(), "cuda:0")
+    module.unregister_kv_cache(1)
+    dev.mem_get_info.return_value = (10 * _MIB, 80 << 30)
+
+    with pytest.raises(RuntimeError, match=r"release of instance\(s\) \[1\]"):
+        module._check_device_alloc(_cuda(0), 300 * _MIB)
+    module._check_device_alloc(_cuda(1), 300 * _MIB)
+
+
+def test_alloc_guard_ignores_non_cuda_devices(monkeypatch, clock, dev) -> None:
+    module = _module(monkeypatch)
+    module._check_device_alloc(SimpleNamespace(type="cpu"), 1 << 40)
+    dev.mem_get_info.assert_not_called()
+
+
+def test_alloc_guard_is_the_platform_hook_until_close(monkeypatch, clock, dev) -> None:
+    # First Party
+    from lmcache.v1.platform.base import cache_context as base_cc
+
+    module = _module(monkeypatch)
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        module, "_check_device_alloc", lambda d, n: calls.append((str(d), n))
+    )
+    # The hook holds the bound method installed at construction, not the patch.
+    dev.mem_get_info.return_value = (1 << 40, 1 << 40)
+    base_cc.check_device_alloc(_cuda(0), 4096)
+    dev.mem_get_info.assert_called_once()
+
+    module.close()
+    dev.mem_get_info.reset_mock()
+    base_cc.check_device_alloc(_cuda(0), 4096)
+    dev.mem_get_info.assert_not_called()
+
+
 # --------------------------------------------------------------- stuck path --
 
 

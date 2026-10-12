@@ -41,6 +41,7 @@ from lmcache.v1.multiprocess.group_view import (
 )
 from lmcache.v1.platform.base.cache_context import (
     BaseCacheContext,
+    check_device_alloc,
     close_wrappers_after_failed_init,
 )
 
@@ -117,11 +118,9 @@ class _TempGPUBuffer:
         self._lmcache_tokens_per_chunk = lmcache_tokens_per_chunk
         self._max_batch_size = max_batch_size
 
-        self._temp_buffer = torch.empty(
-            self._get_size_for_single_batch() * max_batch_size,
-            dtype=torch.uint8,
-            device=device,
-        )
+        nbytes = self._get_size_for_single_batch() * max_batch_size
+        check_device_alloc(device, nbytes)
+        self._temp_buffer = torch.empty(nbytes, dtype=torch.uint8, device=device)
 
         # Offset map: (batch_idx, object_group_idx, kernel_group_idx) ->
         # (byte offset in the temp buffer, size of the buffer in bytes)
@@ -443,6 +442,7 @@ class GPUCacheContext(BaseCacheContext):
         # The caller copies block_ids into this buffer before launching the
         # block-level kernel. Single-thread assumption: no lock needed.
         _MAX_BLOCK_IDS = 1 << 20
+        check_device_alloc(self.device_, _MAX_BLOCK_IDS * 8)
         block_ids_buffer = torch.empty(
             _MAX_BLOCK_IDS, dtype=torch.long, device=self.device_
         )
@@ -463,6 +463,7 @@ class GPUCacheContext(BaseCacheContext):
                 self.kv_caches_, self.get_engine_kv_format(idx), group.layer_indices
             )
             self._group_kv_pointer_lists.append(list(ptrs))
+            check_device_alloc(self.device_, len(ptrs) * 8)
             self.group_kv_pointers_.append(list_to_gpu_tensor(ptrs, self.device_))
 
         # Temporary GPU buffer for transfers — a single flat uint8 buffer

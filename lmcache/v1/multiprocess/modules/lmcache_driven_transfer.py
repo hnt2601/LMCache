@@ -50,6 +50,7 @@ from lmcache.v1.periodic_thread import (
 )
 from lmcache.v1.platform.base.cache_context import (
     BaseCacheContext,
+    set_device_alloc_guard,
     set_failed_init_closer,
 )
 from lmcache.v1.platform.base.event_ipc import (
@@ -183,6 +184,37 @@ STUCK_RELEASE_EXIT_CODE = 75
 #: finished, so commit callbacks still buffered in the host-func dispatcher
 #: are dropped rather than committed.
 _POISON_RETENTION_SECONDS = 300.0
+
+
+#: Free device memory kept on top of a guarded allocation (see
+#: _check_device_alloc), for other processes allocating concurrently.
+_ALLOC_GUARD_MARGIN_BYTES = 64 << 20
+
+#: A registered instance's wait pending longer than this makes its device
+#: unsafe for the allocator's OOM path (see _check_device_alloc). Shorter than
+#: stale_wait_seconds: that one only delays unmaps, this one guards the MQ loop.
+_ALLOC_GUARD_WAIT_SECONDS = 1.0
+
+
+def _allocator_segment_bytes(nbytes: int) -> int:
+    """Return the size of the segment the caching allocator would cudaMalloc.
+
+    Mirrors PyTorch's CUDACachingAllocator: requests up to 1 MiB come from a
+    2 MiB small-pool segment, requests under 10 MiB from a 20 MiB segment,
+    larger ones are rounded up to a multiple of 2 MiB.
+
+    Args:
+        nbytes: The requested size in bytes.
+
+    Returns:
+        The segment size in bytes.
+    """
+    mib = 1 << 20
+    if nbytes <= mib:
+        return 2 * mib
+    if nbytes < 10 * mib:
+        return 20 * mib
+    return -(-nbytes // (2 * mib)) * (2 * mib)
 
 
 @dataclass(frozen=True)
@@ -332,6 +364,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         )
         self._device_host_func_dispatcher.start()
         set_failed_init_closer(self._submit_rollback_close)
+        set_device_alloc_guard(self._check_device_alloc)
 
     def _init_release_state(
         self, release_config: IPCReleaseConfig | None = None
@@ -368,6 +401,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             "force_blocked": 0,
             "release_errors": 0,
             "dropped_commits": 0,
+            "alloc_refused": 0,
         }
         self._release_lock = threading.Lock()
         # Serializes release cycles (release thread vs. shutdown).
@@ -660,7 +694,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             oldest = None
         return list(events), oldest
 
-    def _stale_registered_devices(self, now: float) -> dict[str, list[int]]:
+    def _stale_registered_devices(
+        self, now: float, limit: float | None = None
+    ) -> dict[str, list[int]]:
         """Return devices where a registered instance has a stale wait.
 
         A wait older than ``stale_wait_seconds`` on a still-registered
@@ -670,6 +706,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
         Args:
             now: Current ``time.monotonic()``.
+            limit: Age that makes a wait stale; None uses
+                ``stale_wait_seconds``.
 
         Returns:
             Device key (see _entry_device_key) -> instance IDs with stale waits.
@@ -677,7 +715,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         with self._lock:
             entries = list(self._cache_contexts.items())
         stale: dict[str, list[int]] = {}
-        limit = self._release_config.stale_wait_seconds
+        if limit is None:
+            limit = self._release_config.stale_wait_seconds
         for instance_id, entry in entries:
             _, oldest = self._held_imports(entry)
             if (
@@ -708,6 +747,78 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 blocked.add(self._entry_device_key(entry))
         del pending
         return blocked
+
+    def _check_device_alloc(self, device: Any, nbytes: int) -> None:
+        """Refuse a registration's allocation that could hang the MQ loop.
+
+        Installed as the platform's device allocation guard; it runs before
+        each GPU allocation of a cache context built by REGISTER, on the MQ
+        loop. When cudaMalloc fails, PyTorch's caching allocator cudaFrees
+        its cached blocks and retries, and cudaFree waits for the whole
+        device: behind a stream stuck on a dead worker's event it never
+        returns, stalling the server for every worker on the node. So when
+        the device lacks room for a fresh segment and has a possibly stuck
+        stream, fail the registration instead (the worker sees the error).
+        With room, or with every stream on the device live, allocate as usual:
+        the allocator may still reclaim cached memory, but any wait it
+        blocks on completes.
+
+        Args:
+            device: The device about to be allocated on.
+            nbytes: The requested size in bytes.
+
+        Raises:
+            RuntimeError: The allocation is refused.
+        """
+        if getattr(device, "type", None) != "cuda":
+            return
+        need = _allocator_segment_bytes(nbytes) + _ALLOC_GUARD_MARGIN_BYTES
+        free, _ = torch_dev.mem_get_info(device)
+        if free >= need:
+            return
+        reason = self._device_alloc_risk(str(device), time.monotonic())
+        if reason is None:
+            logger.warning(
+                "Allocating %d bytes on %s with only %d bytes free; no stream "
+                "there looks stuck, so the allocator may reclaim cached memory",
+                nbytes,
+                device,
+                free,
+            )
+            return
+        with self._release_lock:
+            self._release_counters["alloc_refused"] += 1
+        raise RuntimeError(
+            f"Refusing to allocate {nbytes} bytes on {device} during "
+            f"registration: {free} bytes free and {reason}, so an out-of-memory "
+            "retry could block the server behind a stuck stream; retry once "
+            "memory is freed or the stuck release completes"
+        )
+
+    def _device_alloc_risk(self, device_key: str, now: float) -> str | None:
+        """Return why the allocator's OOM path could block on a device.
+
+        Args:
+            device_key: The device (see _entry_device_key).
+            now: Current ``time.monotonic()``.
+
+        Returns:
+            A reason, or None when every stream on the device is live.
+        """
+        stale = self._stale_registered_devices(now, _ALLOC_GUARD_WAIT_SECONDS)
+        if device_key in stale:
+            return f"instance(s) {sorted(stale[device_key])} have a wait pending"
+        with self._release_lock:
+            pending = [
+                (p.instance_id, p.entry)
+                for p in self._pending_releases.values()
+                if self._entry_device_key(p.entry) == device_key
+            ]
+        busy = sorted(iid for iid, entry in pending if not self._stream_drained(entry))
+        del pending
+        if busy:
+            return f"the release of instance(s) {busy} has not drained"
+        return None
 
     def _finalize_releases(
         self,
@@ -1168,6 +1279,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         # Clear the rollback hook first, then refuse new unmap jobs, so no job
         # lands on a queue after its stop sentinel.
         set_failed_init_closer(None)
+        set_device_alloc_guard(None)
         with self._release_lock:
             self._unmap_stopped = True
             unmap_queues = list(self._unmap_queues.values())
@@ -1233,6 +1345,56 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             separate_object_groups=self._ctx.separate_object_groups,
             full_sw_kv=self._ctx.full_sw_kv,
         )
+        try:
+            event_backend = self._register_layout(cache_context, model_name, world_size)
+        except BaseException:
+            # The context holds the worker's IPC mappings; a failed REGISTER
+            # must not pin its KV pool. Unmap off the MQ loop, like a release.
+            self._submit_unmap(
+                [
+                    ContextEntry(
+                        cache_context=cache_context,
+                        model_name=model_name,
+                        world_size=world_size,
+                    )
+                ]
+            )
+            del cache_context
+            raise
+
+        with self._release_lock:
+            generation = self._next_generation
+            self._next_generation += 1
+        with self._lock:
+            self._cache_contexts[instance_id] = ContextEntry(
+                cache_context=cache_context,
+                model_name=model_name,
+                world_size=world_size,
+                last_seen=now,
+                has_liveness_signal=False,
+                event_backend=event_backend,
+                generation=generation,
+            )
+
+        logger.info(
+            "Registered KV cache for GPU ID %d with %d layers",
+            instance_id,
+            cache_context.num_layers,
+        )
+
+    def _register_layout(
+        self, cache_context: BaseCacheContext, model_name: str, world_size: int
+    ) -> EventIPCBackend:
+        """Check event support and register the layout of a new context.
+
+        Args:
+            cache_context: The context just built by REGISTER.
+            model_name: The model of the registration.
+            world_size: The world size of the registration.
+
+        Returns:
+            The event backend of the context's device.
+        """
         kv_groups_manager = cache_context.kv_layer_groups_manager
         num_object_groups = kv_groups_manager.num_object_groups
         event_backend = get_event_ipc_backend(cache_context.device)
@@ -1256,26 +1418,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             attn_desc,
             group_layout_descs=group_layout_descs,
         )
-
-        with self._release_lock:
-            generation = self._next_generation
-            self._next_generation += 1
-        with self._lock:
-            self._cache_contexts[instance_id] = ContextEntry(
-                cache_context=cache_context,
-                model_name=model_name,
-                world_size=world_size,
-                last_seen=now,
-                has_liveness_signal=False,
-                event_backend=event_backend,
-                generation=generation,
-            )
-
-        logger.info(
-            "Registered KV cache for GPU ID %d with %d layers",
-            instance_id,
-            cache_context.num_layers,
-        )
+        return event_backend
 
     @request_handler()
     def unregister_kv_cache(self, instance_id: int) -> None:
