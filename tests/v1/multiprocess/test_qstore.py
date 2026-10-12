@@ -254,8 +254,9 @@ def test_store_q_block_id_underflow_fails_closed(stub_device) -> None:
 
 
 class _FakeLMCacheDriven:
-    def __init__(self, ctx) -> None:
+    def __init__(self, ctx, release_config=None) -> None:
         self.ctx = ctx
+        self.release_config = release_config
 
 
 class _FakeEngineDriven:

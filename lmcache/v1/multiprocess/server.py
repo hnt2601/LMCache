@@ -235,11 +235,15 @@ def _build_server_components(
         stale_wait_seconds=mp_config.ipc_release_stale_wait_seconds,
     )
     if mp_config.supported_transfer_mode == "lmcache_driven":
-        transfer_modules.append(LMCacheDrivenTransferModule(ctx, release_config))
+        transfer_modules.append(
+            LMCacheDrivenTransferModule(ctx, release_config=release_config)
+        )
     elif mp_config.supported_transfer_mode == "engine_driven":
         transfer_modules.append(EngineDrivenTransferModule(ctx))
     elif mp_config.supported_transfer_mode == "auto":
-        transfer_modules.append(LMCacheDrivenTransferModule(ctx, release_config))
+        transfer_modules.append(
+            LMCacheDrivenTransferModule(ctx, release_config=release_config)
+        )
         transfer_modules.append(EngineDrivenTransferModule(ctx))
     else:
         raise ValueError(

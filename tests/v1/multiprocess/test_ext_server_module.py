@@ -29,8 +29,9 @@ from lmcache.v1.multiprocess.request_handler import iter_request_handlers
 
 
 class _FakeLMCacheDriven:
-    def __init__(self, ctx) -> None:
+    def __init__(self, ctx, release_config=None) -> None:
         self.ctx = ctx
+        self.release_config = release_config
 
 
 class _FakeEngineDriven:
