@@ -887,7 +887,7 @@ def test_add_affinity_thread_pool():
     from lmcache.v1.multiprocess.affinity_pool import AffinityThreadPool
 
     context = zmq.Context.instance()
-    server = MessageQueueServer("tcp://127.0.0.1:15700", context)
+    server = MessageQueueServer("tcp://127.0.0.1:15706", context)
 
     add_handler_helper(
         server,
@@ -937,7 +937,7 @@ def test_affinity_pool_error_on_sync_handler():
     Test that add_affinity_thread_pool raises TypeError for SYNC handlers.
     """
     context = zmq.Context.instance()
-    server = MessageQueueServer("tcp://127.0.0.1:15701", context)
+    server = MessageQueueServer("tcp://127.0.0.1:15707", context)
 
     add_handler_helper(server, "noop", test_mq_handler_helpers.noop_handler)
 
