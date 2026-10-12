@@ -198,15 +198,18 @@ class BaseCacheContext(ABC):
             self._held_import_times[token] = time.monotonic()
             return token
 
-    def release_imported_event(self, token: int) -> None:
+    def release_imported_event(self, token: int) -> bool:
         """Drop the imported event behind ``token``; its stream wait has drained.
 
         Args:
             token: Token returned by :meth:`hold_imported_event`.
+
+        Returns:
+            Whether this context held ``token``.
         """
         with self._held_imports_lock:
-            self._held_imports.pop(token, None)
             self._held_import_times.pop(token, None)
+            return self._held_imports.pop(token, None) is not None
 
     def held_imports_snapshot(self) -> tuple[list[object], float | None]:
         """Return the held imported events and when the oldest was held.

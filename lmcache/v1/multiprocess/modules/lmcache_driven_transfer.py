@@ -451,8 +451,21 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         """
         instance_id, import_token = payload
         entry = self.get_and_touch_context_entry(instance_id)
-        if entry is not None:
-            entry.cache_context.release_imported_event(import_token)
+        if entry is not None and entry.cache_context.release_imported_event(
+            import_token
+        ):
+            return
+        # Unregistered or reaped meanwhile: the context waits in a pending
+        # release, whose drain check relies on its holds being dropped.
+        with self._release_lock:
+            contexts = [
+                p.entry.cache_context
+                for p in self._pending_releases.values()
+                if p.instance_id == instance_id
+            ]
+        for context in contexts:
+            if context.release_imported_event(import_token):
+                return
 
     def register_host_func(self, kind: str, handler: Any, payload_type: Any) -> None:
         """Register *handler* for *kind* on the per-process device host-func
@@ -665,6 +678,14 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         stream = getattr(entry.cache_context, "stream", None)
         if stream is None:
             return True
+        # A held import means a wait on a worker event is still queued on the
+        # stream. Never query it then: behind a wait that never completes the
+        # stream's work queue fills up (about 1k ops), and cudaStreamQuery on
+        # it then blocks -- holding the GIL, which freezes the whole server,
+        # including the release thread that would force the wait.
+        events, _ = self._held_imports(entry)
+        if events:
+            return False
         try:
             return bool(stream.query())
         except Exception:
@@ -1250,9 +1271,6 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         stream still busy after the stuck timeout is left mapped for process
         exit to reclaim instead of hanging shutdown.
         """
-        # Stop the drain thread before storage_manager.close() so any
-        # in-flight completions reach a live storage manager.
-        self._device_host_func_dispatcher.stop()
         with self._release_lock:
             self._closing = True
             release_thread = self._release_thread
@@ -1281,6 +1299,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             if (not leftover and not unmapping) or time.monotonic() >= deadline:
                 break
             time.sleep(cfg.poll_interval_seconds)
+        # Stop the drain thread only now: its callbacks drop the imported-event
+        # holds the drain checks above rely on. Still before
+        # storage_manager.close(), so in-flight completions reach a live
+        # storage manager.
+        self._device_host_func_dispatcher.stop()
         # Stop the unmapper after its queued work; never join it, since an
         # unmap stuck on the GPU must not hang shutdown.
         # Clear the rollback hook first, then refuse new unmap jobs, so no job

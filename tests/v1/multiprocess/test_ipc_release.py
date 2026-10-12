@@ -160,9 +160,11 @@ def _register(
     cache_context.num_layers = 1
     cache_context.stream = stream
     cache_context.device = device
-    cache_context.held_imports_snapshot.return_value = (
-        [f"event-{instance_id}"],
-        clock.now,
+    # Like the real context: holds are dropped (by the stream's release
+    # callbacks) by the time the stream has drained.
+    cache_context._holds = {"value": ([f"event-{instance_id}"], clock.now)}
+    cache_context.held_imports_snapshot.side_effect = lambda: (
+        cache_context._holds["value"] if not stream.drained else ([], None)
     )
     monkeypatch.setattr(gpu_mod, "create_cache_context", lambda *a, **kw: cache_context)
     monkeypatch.setattr(gpu_mod, "get_event_ipc_backend", lambda device: backend)
@@ -297,7 +299,7 @@ def test_too_old_wait_is_never_forced(monkeypatch, clock, dev) -> None:
     backend = _ForcingBackend(stream)
     ctx = _register(module, monkeypatch, clock, 1, stream, backend)
     # The pending wait was held 400s before the release.
-    ctx.held_imports_snapshot.return_value = (["event-1"], clock.now - 400.0)
+    ctx._holds["value"] = (["event-1"], clock.now - 400.0)
     module.unregister_kv_cache(1)
 
     clock.now += 31.0
@@ -415,7 +417,7 @@ def test_stale_wait_on_registered_instance_blocks_its_device(
     ctx_dead = _register(
         module, monkeypatch, clock, 1, dead, _LegacyBackend(), "cuda:0"
     )
-    ctx_dead.held_imports_snapshot.return_value = (["e"], clock.now)
+    ctx_dead._holds["value"] = (["e"], clock.now)
     clock.now += 11.0  # past stale_wait_seconds (10s default)
 
     same = _Stream(drained=True)
@@ -500,7 +502,7 @@ def test_unmapper_rechecks_gating_before_closing(monkeypatch, clock, dev) -> Non
     ctx_dead = _register(
         module, monkeypatch, clock, 1, dead, _LegacyBackend(), "cuda:0"
     )
-    ctx_dead.held_imports_snapshot.return_value = (["e"], clock.now - 60.0)
+    ctx_dead._holds["value"] = (["e"], clock.now - 60.0)
     same = _Stream(drained=True)
     ctx_same = _register(
         module, monkeypatch, clock, 2, same, _LegacyBackend(), "cuda:0"
@@ -589,7 +591,7 @@ def test_alloc_guard_allows_when_a_segment_fits(monkeypatch, clock, dev) -> None
     module = _module(monkeypatch)
     dead = _Stream(drained=False)
     ctx = _register(module, monkeypatch, clock, 1, dead, _LegacyBackend())
-    ctx.held_imports_snapshot.return_value = (["e"], clock.now - 60.0)
+    ctx._holds["value"] = (["e"], clock.now - 60.0)
     dev.mem_get_info.return_value = (20 * _MIB + 64 * _MIB, 80 << 30)
 
     module._check_device_alloc(_cuda(0), 8 * _MIB)  # 20 MiB segment + margin fits
@@ -610,10 +612,10 @@ def test_alloc_guard_refuses_next_to_a_stuck_wait_only_on_its_device(
     ctx = _register(module, monkeypatch, clock, 1, dead, _LegacyBackend(), "cuda:0")
     dev.mem_get_info.return_value = (10 * _MIB, 80 << 30)
 
-    ctx.held_imports_snapshot.return_value = (["e"], clock.now - 0.5)
+    ctx._holds["value"] = (["e"], clock.now - 0.5)
     module._check_device_alloc(_cuda(0), 8 * _MIB)  # live wait: allowed
 
-    ctx.held_imports_snapshot.return_value = (["e"], clock.now - 2.0)
+    ctx._holds["value"] = (["e"], clock.now - 2.0)
     with pytest.raises(RuntimeError, match=r"instance\(s\) \[1\] have a wait"):
         module._check_device_alloc(_cuda(0), 8 * _MIB)
     module._check_device_alloc(_cuda(1), 8 * _MIB)  # other GPU unaffected
@@ -677,6 +679,98 @@ def test_alloc_guard_is_the_platform_hook_until_close(monkeypatch, clock, dev) -
     dev.mem_get_info.reset_mock()
     base_cc.check_device_alloc(_cuda(0), 4096)
     dev.mem_get_info.assert_not_called()
+
+
+class _NeverQueryStream(_Stream):
+    """A stream whose query() would block: behind a never-completing wait its
+    work queue fills up and cudaStreamQuery blocks (holding the GIL)."""
+
+    def query(self) -> bool:
+        raise AssertionError("queried a stream that still has a held wait")
+
+
+def test_stream_with_held_waits_is_never_queried(monkeypatch, clock, dev) -> None:
+    """Release, gating, the alloc guard and /status must decide "not drained"
+    host-side while a worker-event wait is held, without touching the stream."""
+    module = _module(monkeypatch)
+    stream = _NeverQueryStream(drained=False)
+    ctx = _register(module, monkeypatch, clock, 1, stream, _LegacyBackend())
+    ctx._holds["value"] = (["e"], clock.now - 60.0)
+    other = _Stream(drained=True)
+    _register(module, monkeypatch, clock, 2, other, _LegacyBackend(), "cuda:0")
+    dev.mem_get_info.return_value = (1 << 20, 80 << 30)
+
+    assert module.release_status()["stale_wait_instance_ids"] == [1]
+    with pytest.raises(RuntimeError, match="have a wait pending"):
+        module._check_device_alloc(_cuda(0), 300 << 20)
+    module.unregister_kv_cache(2)  # same device: held back, not queried
+    module.unregister_kv_cache(1)
+    clock.now += 100.0
+    module._release_cycle()
+    assert sorted(module.release_status()["pending_instance_ids"]) == [1, 2]
+
+
+def test_release_callback_drops_the_hold_of_a_reaped_instance(
+    monkeypatch, clock, dev
+) -> None:
+    """A wait that retires after its instance was reaped still releases its
+    hold, on the context now waiting in the pending release."""
+    # Third Party
+    import torch
+
+    # First Party
+    from lmcache.v1.platform.base.cache_context import BaseCacheContext
+
+    module = _module(monkeypatch)
+    context = MagicMock(name="context")
+    context.device = torch.device("cuda", 0)
+    context.stream = _Stream(drained=True)
+    context._held_imports = {}
+    context._held_import_times = {}
+    context._held_imports_lock = threading.Lock()
+    context.hold_imported_event = lambda e: BaseCacheContext.hold_imported_event(
+        context, e
+    )
+    context.release_imported_event = lambda t: BaseCacheContext.release_imported_event(
+        context, t
+    )
+    context.held_imports_snapshot = lambda: BaseCacheContext.held_imports_snapshot(
+        context
+    )
+    monkeypatch.setattr(gpu_mod, "create_cache_context", lambda *a, **kw: context)
+    monkeypatch.setattr(gpu_mod, "get_event_ipc_backend", lambda d: _LegacyBackend())
+    monkeypatch.setattr(gpu_mod, "get_layout_desc", lambda *a, **kw: MagicMock())
+    module.register_kv_cache(1, MagicMock(), "m", 1, MagicMock(), MagicMock(), [])
+    token = context.hold_imported_event("event")
+    clock.now += 500.0
+    module.reap_stale_instances(reap_timeout_s=60.0, registration_grace_s=60.0)
+    assert module.release_status()["pending_instance_ids"] == [1]
+
+    module._release_imported_event((1, token))
+
+    assert context.held_imports_snapshot() == ([], None)
+    module._release_cycle()
+    context.close.assert_called_once()
+
+
+def test_close_keeps_dispatching_callbacks_until_releases_ran(
+    monkeypatch, clock, dev
+) -> None:
+    module = _module(monkeypatch)
+    order: list[str] = []
+    module._device_host_func_dispatcher.stop.side_effect = lambda: order.append(
+        "dispatcher.stop"
+    )
+    real_cycle = module._release_cycle
+
+    def cycle(*args, **kwargs):
+        order.append("release_cycle")
+        return real_cycle(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_release_cycle", cycle)
+    _register(module, monkeypatch, clock, 1, _Stream(drained=True), _LegacyBackend())
+    module.close()
+    assert order.index("dispatcher.stop") > order.index("release_cycle")
 
 
 # --------------------------------------------------------------- stuck path --
