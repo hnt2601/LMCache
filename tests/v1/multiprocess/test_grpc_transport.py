@@ -155,8 +155,8 @@ def grpc_client() -> Iterator[tuple[GrpcMultiprocessClient, _Calls]]:
             return RegisterEngineDrivenContextResponse("shared-memory", 4096)
 
         @request_handler(HandlerType.BLOCKING)
-        def ping(self, instance_id: int | None) -> bool:
-            return instance_id == 7
+        def ping(self, instance_id: int | None) -> int:
+            return 1234 if instance_id == 7 else 0
 
         @request_handler(HandlerType.BLOCKING)
         def clear(self, force: bool = False) -> None:
@@ -566,7 +566,9 @@ def test_generated_grpc_services_communicate_end_to_end(
         )
     ).result(5)
     assert registration == RegisterEngineDrivenContextResponse("shared-memory", 4096)
-    assert client.ping(7).result(5) is True
+    # PingResponse.ok stays a proto bool: a boot token arrives as 1 (truthy;
+    # no restart detection over gRPC).
+    assert client.ping(7).result(5) == 1
     assert client.clear().result(5) is None
     assert calls.clear_force is False
     assert client.clear(force=True).result(5) is None

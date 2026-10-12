@@ -358,6 +358,11 @@ def _build_server_components(
     management = ManagementModule(
         ctx,
         liveness_targets=liveness_targets,
+        registration_targets=[
+            m
+            for m in transfer_modules
+            if isinstance(m, (LMCacheDrivenTransferModule, EngineDrivenTransferModule))
+        ],
         worker_reap_timeout_seconds=mp_config.worker_reap_timeout_seconds,
         worker_registration_grace_seconds=mp_config.worker_registration_grace_seconds,
         experimental_transfer=experimental_transfer,

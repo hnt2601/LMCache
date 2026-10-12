@@ -33,6 +33,7 @@ from lmcache.v1.multiprocess.transport.zmq_impl.mq import (
     BlockingRequestHandler,
     MessageQueueClient,
     MessageQueueServer,
+    ServerHandlerError,
 )
 from lmcache.v1.multiprocess.transport.zmq_impl.server import (
     add_handler_helper,
@@ -1068,3 +1069,51 @@ def test_mq_server_loop_stall_tracks_iterations(tmp_path) -> None:
     finally:
         server.close()
     assert server.main_loop_stall_seconds() is None
+
+
+def test_sync_handler_error_fails_the_caller_fast(tmp_path) -> None:
+    """A SYNC handler that raises answers with an error frame: the caller's
+    future fails at once with the message instead of timing out, and the
+    loop keeps serving."""
+    calls = {"n": 0}
+
+    def flaky_noop() -> str:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("Refusing to allocate 268435456 bytes on cuda:1")
+        return "NOOP_OK"
+
+    url = f"ipc://{tmp_path}/sync-error.sock"
+    context = zmq.Context()
+    server = MessageQueueServer(url, context)
+    server.add_handler("noop", HandlerType.SYNC, flaky_noop)
+    server.start()
+    client = MessageQueueClient(url, context)
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(ServerHandlerError, match="Refusing to allocate"):
+            client.submit_request("noop", []).result(timeout=10)
+        assert time.monotonic() - t0 < 5
+        assert client.submit_request("noop", []).result(timeout=10) == "NOOP_OK"
+    finally:
+        client.close()
+        server.close()
+        context.term()
+
+
+def test_handler_error_frame_is_undecodable_as_a_response() -> None:
+    """A client without error-frame support must fail to decode the marker
+    (and so drop the frame and time out, as before) rather than mistake it
+    for a valid response of any type."""
+    # First Party
+    from lmcache.v1.multiprocess.transport.zmq_impl.mq import (
+        _HANDLER_ERROR_MARKER,
+        msgspec_decode,
+    )
+
+    # Third Party
+    import msgspec
+
+    for cls in (type(None), bool, int, str, list[int]):
+        with pytest.raises((msgspec.DecodeError, msgspec.ValidationError)):
+            msgspec_decode(_HANDLER_ERROR_MARKER, cls=cls)

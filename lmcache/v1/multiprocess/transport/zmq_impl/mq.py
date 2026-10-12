@@ -113,6 +113,17 @@ def _enable_tcp_keepalive(socket: zmq.Socket) -> None:
     socket.setsockopt(zmq.TCP_KEEPALIVE_CNT, _TCP_KEEPALIVE_PROBES)
 
 
+#: First frame of the reply to a SYNC request whose handler raised; the second
+#: frame is the msgpack-encoded error message. 0xc1 is never valid msgpack, so
+#: a client without this support fails to decode it as the response, drops
+#: the frame and times out, exactly as when no reply was sent at all.
+_HANDLER_ERROR_MARKER = b"\xc1lmcache-handler-error"
+
+
+class ServerHandlerError(RuntimeError):
+    """The server's handler for a request raised; carries its message."""
+
+
 def msgspec_encode(obj: Any, cls: Any) -> bytes:
     # Handle special cases
     if cls in _SPECIAL_ENCODER_DECODERS:
@@ -408,7 +419,14 @@ class MessageQueueClient:
                     )
                 )
                 return
-            if b_response:
+            if len(b_response) >= 2 and b_response[0] == _HANDLER_ERROR_MARKER:
+                future.set_exception(
+                    ServerHandlerError(
+                        f"{rpc_spec.operation} failed on the server: "
+                        f"{msgspec.msgpack.decode(b_response[1])}"
+                    )
+                )
+            elif b_response:
                 response = msgspec_decode(b_response[0], cls=rpc_spec.response_type)
                 future.set_result(response)
             else:
@@ -594,7 +612,19 @@ class MessageQueueServer(RequestServer):
             payloads (list[bytes]): The payloads of the request.
             prefix_frames (list[bytes]): The prefix frames to send back.
         """
-        response = handler_entry(payloads)
+        try:
+            response = handler_entry(payloads)
+        except Exception as e:
+            # Fail the caller now instead of leaving it to its timeout (for
+            # REGISTER_KV_CACHE, mq_timeout: minutes). The caller logs it.
+            self.socket.send_multipart(
+                prefix_frames
+                + [
+                    _HANDLER_ERROR_MARKER,
+                    msgspec.msgpack.encode(f"{type(e).__name__}: {e}"),
+                ]
+            )
+            raise
         response_cls = handler_entry.get_response_class()
         b_response = msgspec_encode(response, cls=response_cls)
         if response is not None:

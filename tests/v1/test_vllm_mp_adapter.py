@@ -1435,6 +1435,9 @@ def _stepped_heartbeat(monkeypatch, tokens, initial_boot_token=None):
     recoveries: list[int] = []
 
     def recover() -> bool:
+        # Transfers must be gated while re-registering (the new transfer
+        # context is not registered yet).
+        assert not health_event.is_set()
         recoveries.append(1)
         return True
 
@@ -1478,12 +1481,46 @@ def test_heartbeat_reregisters_when_server_no_longer_tracks_it(monkeypatch) -> N
     assert recoveries == [1]
 
 
+def test_heartbeat_failed_reregistration_stays_degraded(monkeypatch) -> None:
+    heartbeat, _ = _stepped_heartbeat(monkeypatch, [111, -111, -111, 111])
+    heartbeat.register_recover_callback(lambda: False)
+    heartbeat._execute()
+    assert heartbeat._health_event.is_set()
+    heartbeat._execute()  # untracked, re-register fails
+    assert not heartbeat._health_event.is_set()
+    heartbeat._execute()  # still untracked, still failing
+    assert not heartbeat._health_event.is_set()
+    heartbeat.register_recover_callback(lambda: True)
+    heartbeat._execute()  # unhealthy -> healthy edge retries and succeeds
+    assert heartbeat._health_event.is_set()
+
+
+def test_heartbeat_first_check_released_when_cycle_raises(monkeypatch) -> None:
+    def boom(req_client, timeout, instance_id=None):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(adapter_mod, "send_ping", boom)
+    heartbeat = HeartbeatThread(
+        req_client=MagicMock(), health_event=threading.Event(), interval=60.0
+    )
+    with pytest.raises(RuntimeError):
+        heartbeat._execute()
+    assert heartbeat.wait_for_initial_check(timeout=0)
+
+
 def test_heartbeat_legacy_server_token_never_triggers_recovery(monkeypatch) -> None:
     """A server without boot tokens answers True (decoded as 1) every time."""
     heartbeat, recoveries = _stepped_heartbeat(monkeypatch, [1, 1, 1])
     for _ in range(3):
         heartbeat._execute()
     assert recoveries == []
+
+
+@pytest.mark.parametrize(
+    "raw, expected", [(True, True), ("true", True), ("false", False), (False, False)]
+)
+def test_early_heartbeat_flag_parses_strings(raw, expected) -> None:
+    assert adapter_mod._coerce_extra_config_value(False, raw) is expected
 
 
 def test_early_heartbeat_after_register_starts_heartbeat(fake_adapter) -> None:

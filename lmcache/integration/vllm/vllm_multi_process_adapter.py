@@ -567,6 +567,17 @@ class HeartbeatThread(PeriodicThread):
         self._recover_callback = callback
 
     def _execute(self) -> ThreadRunSummary:
+        """Run one heartbeat cycle; see :meth:`_execute_cycle`.
+
+        Marks the first cycle done however it ends, so callers waiting in
+        :meth:`wait_for_initial_check` are released promptly.
+        """
+        try:
+            return self._execute_cycle()
+        finally:
+            self._first_check_done.set()
+
+    def _execute_cycle(self) -> ThreadRunSummary:
         """Run one heartbeat cycle: ping, recover callback, event update.
 
         A cycle that observes a stop request returns without firing the
@@ -610,6 +621,12 @@ class HeartbeatThread(PeriodicThread):
             else:
                 reason = "LMCache server is healthy again"
             logger.warning("%s, triggering recovery callback", reason)
+            if was_healthy:
+                # Degrade while re-registering, as on the unhealthy->healthy
+                # edge: the old registration is gone on the server and the new
+                # transfer context is not registered yet, so transfers must
+                # not be submitted meanwhile.
+                self._health_event.clear()
             # If the callback fails, it should not become healthy
             healthy = self._recover_callback()
 
@@ -624,7 +641,6 @@ class HeartbeatThread(PeriodicThread):
             if was_healthy:
                 logger.warning("LMCache server is unhealthy — entering degraded mode")
 
-        self._first_check_done.set()
         return ThreadRunSummary(
             success=True,
             message="healthy" if healthy else "unhealthy",
@@ -1574,9 +1590,14 @@ class LMCacheMPWorkerAdapter:
         # (e.g. during CUDA graph capture) has then pinged at least once, so
         # the server reaps it after the reap timeout instead of the much
         # longer registration grace, and releases its KV pool sooner.
-        self._early_heartbeat_after_register = bool(
-            extra_config.get("lmcache.mp.early_heartbeat_after_register", False)
+        raw_early = (
+            extra_config.get("lmcache.mp.early_heartbeat_after_register")
             if extra_config
+            else None
+        )
+        self._early_heartbeat_after_register = (
+            _coerce_extra_config_value(False, raw_early)
+            if raw_early is not None
             else False
         )
 

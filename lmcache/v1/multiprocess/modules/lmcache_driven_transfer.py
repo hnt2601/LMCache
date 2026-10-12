@@ -363,8 +363,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             payload_type=tuple[int, L1WriteCompletion],
         )
         self._device_host_func_dispatcher.start()
-        set_failed_init_closer(self._submit_rollback_close)
-        set_device_alloc_guard(self._check_device_alloc)
+        # Kept so close() removes exactly the hooks this module installed.
+        self._installed_hooks = (self._submit_rollback_close, self._check_device_alloc)
+        set_failed_init_closer(self._installed_hooks[0])
+        set_device_alloc_guard(self._installed_hooks[1])
 
     def _init_release_state(
         self, release_config: IPCReleaseConfig | None = None
@@ -1283,8 +1285,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         # unmap stuck on the GPU must not hang shutdown.
         # Clear the rollback hook first, then refuse new unmap jobs, so no job
         # lands on a queue after its stop sentinel.
-        set_failed_init_closer(None)
-        set_device_alloc_guard(None)
+        set_failed_init_closer(None, replacing=self._installed_hooks[0])
+        set_device_alloc_guard(None, replacing=self._installed_hooks[1])
         with self._release_lock:
             self._unmap_stopped = True
             unmap_queues = list(self._unmap_queues.values())

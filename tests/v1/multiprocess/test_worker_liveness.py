@@ -246,6 +246,20 @@ def test_management_ping_touches_targets() -> None:
     assert target.touched == [42]
 
 
+def test_management_ping_reregisters_on_kv_owner_answers_only() -> None:
+    """A reaped KV registration is redone even if another liveness target
+    (e.g. a qstore entry) still tracks the instance."""
+    kv, other = _FakeTarget(), _FakeTarget()
+    kv.tracks = False
+    mgmt = ManagementModule(
+        MagicMock(), liveness_targets=[kv, other], registration_targets=[kv]
+    )
+    assert mgmt.ping(5) < 0
+    assert other.touched == [5]  # still refreshed
+    kv.tracks = True
+    assert mgmt.ping(5) > 0
+
+
 def test_management_ping_boot_token_is_per_process() -> None:
     a = ManagementModule(MagicMock(), liveness_targets=[_FakeTarget()])
     b = ManagementModule(MagicMock(), liveness_targets=[_FakeTarget()])

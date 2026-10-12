@@ -220,8 +220,10 @@ class CudaIPCWrapper(DeviceIPCWrapper):
             device_index, *self.handle[1:]
         )
 
+        # Zero elements: no allocator call (a real one could take the
+        # allocator's OOM path on the MQ loop); set_ replaces the storage.
         t = torch.empty(
-            (), device=f"{torch_device_type}:{device_index}", dtype=self.dtype
+            (0,), device=f"{torch_device_type}:{device_index}", dtype=self.dtype
         )
         t.set_(storage, self.storage_offset, self.shape, self.stride)
         return t

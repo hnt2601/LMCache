@@ -47,13 +47,24 @@ logger = init_logger(__name__)
 _failed_init_closer: "weakref.WeakMethod | None" = None
 
 
-def set_failed_init_closer(closer: Any | None) -> None:
+def _is_current(ref: "weakref.WeakMethod | None", method: Any) -> bool:
+    """Return whether ``ref`` still resolves to ``method``."""
+    return ref is not None and ref() == method
+
+
+def set_failed_init_closer(closer: Any | None, *, replacing: Any = None) -> None:
     """Install (or clear, with None) the failed-construction wrapper closer.
 
     Args:
         closer: A bound method ``closer(wrappers, device_key)``, or None.
+        replacing: When clearing, only clear if this bound method is the one
+            installed, so one module's close() cannot drop another's hook.
     """
     global _failed_init_closer
+    if closer is None and replacing is not None:
+        if _is_current(_failed_init_closer, replacing):
+            _failed_init_closer = None
+        return
     _failed_init_closer = weakref.WeakMethod(closer) if closer is not None else None
 
 
@@ -87,13 +98,19 @@ def close_wrappers_after_failed_init(wrappers: list[Any], device_key: str) -> No
 _device_alloc_guard: "weakref.WeakMethod | None" = None
 
 
-def set_device_alloc_guard(guard: Any | None) -> None:
+def set_device_alloc_guard(guard: Any | None, *, replacing: Any = None) -> None:
     """Install (or clear, with None) the device allocation guard.
 
     Args:
         guard: A bound method ``guard(device, nbytes)``, or None.
+        replacing: When clearing, only clear if this bound method is the one
+            installed, so one module's close() cannot drop another's hook.
     """
     global _device_alloc_guard
+    if guard is None and replacing is not None:
+        if _is_current(_device_alloc_guard, replacing):
+            _device_alloc_guard = None
+        return
     _device_alloc_guard = weakref.WeakMethod(guard) if guard is not None else None
 
 

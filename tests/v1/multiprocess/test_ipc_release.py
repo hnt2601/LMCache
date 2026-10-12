@@ -643,6 +643,22 @@ def test_alloc_guard_ignores_non_cuda_devices(monkeypatch, clock, dev) -> None:
     dev.mem_get_info.assert_not_called()
 
 
+def test_closing_one_module_keeps_another_modules_hooks(
+    monkeypatch, clock, dev
+) -> None:
+    # First Party
+    from lmcache.v1.platform.base import cache_context as base_cc
+
+    old = _module(monkeypatch)
+    new = _module(monkeypatch)  # installs its hooks over old's
+    old.close()
+    assert base_cc._device_alloc_guard() == new._check_device_alloc
+    assert base_cc._failed_init_closer() == new._submit_rollback_close
+    new.close()
+    assert base_cc._device_alloc_guard is None
+    assert base_cc._failed_init_closer is None
+
+
 def test_alloc_guard_is_the_platform_hook_until_close(monkeypatch, clock, dev) -> None:
     # First Party
     from lmcache.v1.platform.base import cache_context as base_cc

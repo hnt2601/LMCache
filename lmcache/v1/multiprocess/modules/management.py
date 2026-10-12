@@ -43,6 +43,9 @@ class ManagementModule:
             registered but never pinged.
         experimental_transfer: Types of experimental intermediate tensor
             transfer built in the server.
+        registration_targets: The liveness targets that own KV registrations
+            (the transfer modules); defaults to ``liveness_targets``. PING
+            asks a worker to re-register when none of these tracks it.
     """
 
     def __init__(
@@ -52,10 +55,18 @@ class ManagementModule:
         worker_reap_timeout_seconds: float = 0.0,
         worker_registration_grace_seconds: float = 0.0,
         experimental_transfer: Sequence[str] = (),
+        registration_targets: Sequence[InstanceLivenessTarget] | None = None,
     ) -> None:
         self._ctx = ctx
         self._clear_lock = threading.Lock()
         self._liveness_targets = tuple(liveness_targets)
+        # The targets holding a worker's KV registration; PING tells a worker
+        # to re-register when none of them tracks it (see ping()).
+        self._registration_targets = (
+            tuple(registration_targets)
+            if registration_targets is not None
+            else self._liveness_targets
+        )
         self._reap_timeout = worker_reap_timeout_seconds
         self._reap_grace = worker_registration_grace_seconds
         self._experimental_transfer = tuple(experimental_transfer)
@@ -128,12 +139,16 @@ class ManagementModule:
             alive but unknown here and must re-register.
         """
         if instance_id is not None and self._liveness_targets:
-            # A target answering None (no tracking info) counts as tracking,
-            # so an unknown target can never trigger re-registration storms.
-            tracked = [
-                target.touch_instance(instance_id) for target in self._liveness_targets
-            ]
-            if all(t is False for t in tracked):
+            tracked = {
+                id(target): target.touch_instance(instance_id)
+                for target in self._liveness_targets
+            }
+            # Only the KV registration owners decide: a reaped KV registration
+            # must be redone even if, e.g., a qstore entry is still tracked. A
+            # target answering None (no tracking info) counts as tracking, so
+            # an unknown target can never cause re-registration storms.
+            answers = [tracked.get(id(t)) for t in self._registration_targets]
+            if answers and all(a is False for a in answers):
                 return -self._boot_token
         return self._boot_token
 
