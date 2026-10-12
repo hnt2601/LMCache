@@ -3,7 +3,10 @@
 
 # Standard
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
+import logging
+import os
+import sys
 import threading
 import time
 
@@ -40,6 +43,12 @@ from lmcache.v1.multiprocess.object_group_transfer import (
     transfer_kv_per_object_group,
 )
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
+from lmcache.v1.periodic_thread import (
+    PeriodicThread,
+    ThreadLevel,
+    ThreadRunSummary,
+    create_periodic_thread,
+)
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
 from lmcache.v1.platform.base.event_ipc import (
     EventIPCBackend,
@@ -160,6 +169,58 @@ class ContextEntry:
     event_backend: EventIPCBackend | None = None
 
 
+#: Exit code used by ``stuck_action="exit"`` (EX_TEMPFAIL): the container
+#: runtime restarts the server and the driver reclaims every mapping.
+STUCK_RELEASE_EXIT_CODE = 75
+
+#: How long a force-completed instance stays poisoned after its release
+#: finished, so commit callbacks still buffered in the host-func dispatcher
+#: are dropped rather than committed.
+_POISON_RETENTION_SECONDS = 300.0
+
+
+@dataclass(frozen=True)
+class IPCReleaseConfig:
+    """How an unregistered or reaped instance's CUDA IPC mappings are released.
+
+    Releasing unmaps the worker's KV pool, which first needs the context
+    stream drained. A stream waiting on an event from a dead worker never
+    drains on its own (LMCache#4676), so the release runs in stages instead of
+    blocking: wait for a natural drain, then force-complete the pending
+    imported events, then treat the instance as stuck.
+
+    Args:
+        drain_grace_seconds: How long to wait for the stream to drain on its
+            own before force-completing its imported events.
+        stuck_timeout_seconds: How long to wait after forcing before the
+            instance counts as stuck.
+        stuck_action: ``"quarantine"`` keeps a stuck instance mapped and
+            reports it; ``"exit"`` terminates the server so it restarts and
+            the driver reclaims the memory.
+        poll_interval_seconds: How often pending releases are re-checked.
+    """
+
+    drain_grace_seconds: float = 30.0
+    stuck_timeout_seconds: float = 60.0
+    stuck_action: Literal["quarantine", "exit"] = "quarantine"
+    poll_interval_seconds: float = 1.0
+
+
+@dataclass
+class _PendingRelease:
+    """An instance popped from the registry whose stream has not drained yet.
+
+    Holding ``entry`` keeps the IPC mappings open on purpose: unmapping memory
+    that queued GPU work still references is what hangs the driver.
+    """
+
+    instance_id: int
+    entry: ContextEntry
+    started: float
+    forced_at: float | None = None
+    stuck: bool = False
+
+
 class LMCacheDrivenTransferModule(InstanceLivenessTarget):
     """Handles LMCache-driven KV cache transfer operations.
 
@@ -168,10 +229,17 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
     Args:
         ctx: The shared engine context.
+        release_config: How unregistered or reaped instances release their
+            IPC mappings; see :class:`IPCReleaseConfig`.
     """
 
-    def __init__(self, ctx: MPCacheServerContext) -> None:
+    def __init__(
+        self,
+        ctx: MPCacheServerContext,
+        release_config: IPCReleaseConfig | None = None,
+    ) -> None:
         self._ctx = ctx
+        self._init_release_state(release_config)
         self._cache_contexts: dict[int, ContextEntry] = {}
         # Guards all reads/writes of _cache_contexts. The reaper mutates it
         # off the MQ main loop, so register/unregister/store/retrieve and
@@ -208,7 +276,65 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             self._release_imported_event,
             payload_type=tuple[int, int],
         )
+        self._device_host_func_dispatcher.register(
+            "finish_write_unless_poisoned",
+            self._finish_write_unless_poisoned,
+            payload_type=tuple[int, L1WriteCompletion],
+        )
         self._device_host_func_dispatcher.start()
+
+    def _init_release_state(
+        self, release_config: IPCReleaseConfig | None = None
+    ) -> None:
+        """Initialize the staged IPC release state (see _release_entries).
+
+        Args:
+            release_config: Release timing and stuck policy; defaults apply
+                when None.
+        """
+        self._release_config = release_config or IPCReleaseConfig()
+        # Instances popped from the registry whose stream has not drained.
+        # Guarded by _release_lock (a leaf lock, like _lock).
+        self._pending_releases: dict[int, _PendingRelease] = {}
+        # Force-completed instances -> finish time (None while pending). Their
+        # store commits are dropped: the copies ran without the worker's data.
+        self._poisoned: dict[int, float | None] = {}
+        self._release_counters = {
+            "released": 0,
+            "deferred": 0,
+            "forced": 0,
+            "unforceable": 0,
+            "release_errors": 0,
+            "dropped_commits": 0,
+        }
+        self._release_lock = threading.Lock()
+        self._release_thread: PeriodicThread | None = None
+        self._closing = False
+
+    def _finish_write_unless_poisoned(
+        self, payload: tuple[int, L1WriteCompletion]
+    ) -> None:
+        """Commit a store, unless its instance's events were force-completed.
+
+        A forced event lets the queued D2H copy run whether or not the worker
+        finished writing those blocks, so the copied KV may be partial.
+        Committing it would serve garbage to every reader of the shared pool.
+        Dropped reservations expire under the existing write-TTL rules.
+
+        Args:
+            payload: ``(instance_id, completion)`` of the store.
+        """
+        instance_id, completion = payload
+        with self._release_lock:
+            poisoned = instance_id in self._poisoned
+            if poisoned:
+                self._release_counters["dropped_commits"] += 1
+        if poisoned:
+            logger.warning(
+                "Dropping store commit for force-released instance %d", instance_id
+            )
+            return
+        self._ctx.storage_manager.finish_write_by_owner(completion)
 
     def _release_imported_event(self, payload: tuple[int, int]) -> None:
         """Drop an imported worker event; the stream wait queued on it has run.
@@ -362,7 +488,6 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             for iid in stale_ids:
                 reaped.append((iid, self._cache_contexts.pop(iid)))
         reaped_ids: list[int] = []
-        entries: list[ContextEntry] = []
         for iid, e in reaped:
             logger.warning(
                 "Reaped GPU instance %d: silent for %.1fs (pinged=%s)",
@@ -371,29 +496,102 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 e.has_liveness_signal,
             )
             reaped_ids.append(iid)
-            entries.append(e)
         if reaped:
             del e  # a bound name would pin the final entry (see _release_entries)
-            reaped.clear()
-            self._release_entries(entries)
+            self._release_entries(reaped)
         return reaped_ids
 
-    def _release_entries(self, entries: list[ContextEntry]) -> None:
-        """Release a batch of entries and reclaim their device memory.
+    def _release_entries(self, released: list[tuple[int, ContextEntry]]) -> None:
+        """Release popped instances, never blocking on their streams.
+
+        An entry whose context stream has drained is unmapped right away.
+        One with queued work is handed to the release thread instead:
+        unmapping memory that queued GPU work still references hangs the
+        driver, and waiting here would hang the caller (the reaper or the MQ
+        loop) behind a stream that may never drain (LMCache#4676).
 
         Args:
-            entries: The only remaining references to the released entries.
-                The list is cleared before memory is reclaimed.
+            released: ``(instance_id, entry)`` pairs already popped from the
+                registry. They must be the only remaining references; the
+                list is cleared before memory is reclaimed.
         """
-        if not entries:
+        if not released:
             return
-        for entry in entries:
-            entry.cache_context.close()
+        now = time.monotonic()
+        ready: list[ContextEntry] = []
+        deferred: list[int] = []
+        for instance_id, entry in released:
             self._ctx.layout_desc_registry.unregister(
                 entry.model_name, entry.world_size
             )
+            if self._stream_drained(entry):
+                ready.append(entry)
+                continue
+            with self._release_lock:
+                self._pending_releases[instance_id] = _PendingRelease(
+                    instance_id=instance_id, entry=entry, started=now
+                )
+                self._release_counters["deferred"] += 1
+            deferred.append(instance_id)
         del entry
+        released.clear()
+        self._finalize_releases(ready)
+        if deferred:
+            logger.warning(
+                "IPC release deferred for instance(s) %s: their transfer stream "
+                "still has queued work; retrying every %.1fs",
+                deferred,
+                self._release_config.poll_interval_seconds,
+            )
+            self._ensure_release_thread()
+
+    @staticmethod
+    def _stream_drained(entry: ContextEntry) -> bool:
+        """Return whether the entry's transfer stream has no queued work.
+
+        A query that raises (for example a sticky CUDA error) counts as not
+        drained, so the entry goes through the stuck path instead of being
+        unmapped under a broken context.
+
+        Args:
+            entry: The released entry.
+
+        Returns:
+            True when it is safe to unmap the entry's mappings.
+        """
+        stream = getattr(entry.cache_context, "stream", None)
+        if stream is None:
+            return True
+        try:
+            return bool(stream.query())
+        except Exception:
+            logger.exception("Querying a released context stream failed")
+            return False
+
+    def _finalize_releases(self, entries: list[ContextEntry]) -> None:
+        """Unmap drained entries and reclaim their device memory.
+
+        Args:
+            entries: Entries whose streams have drained. They must be the only
+                remaining references; the list is cleared before memory is
+                reclaimed.
+        """
+        if not entries:
+            return
+        errors = 0
+        for entry in entries:
+            try:
+                entry.cache_context.close()
+            except Exception:
+                # Keep going: one failed close must not strand the others.
+                errors += 1
+                logger.exception("Closing a released cache context failed")
+        del entry
+        count = len(entries)
         entries.clear()
+        with self._release_lock:
+            self._release_counters["released"] += count
+            self._release_counters["release_errors"] += errors
         # ipc_collect() only unmaps a CUDA-IPC-imported segment once its last
         # tensor reference is gone (LMCache#4014), hence the clear() above.
         torch_dev.empty_cache()
@@ -401,6 +599,170 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         if ipc_collect is not None:
             # Backends without IPC collection omit this optional operation.
             ipc_collect()
+
+    def _ensure_release_thread(self) -> None:
+        """Start the release thread on the first deferred release."""
+        with self._release_lock:
+            if self._release_thread is not None or self._closing:
+                return
+            self._release_thread = create_periodic_thread(
+                name="lmcache-mp-ipc-release",
+                interval=self._release_config.poll_interval_seconds,
+                execute_fn=self._release_cycle,
+                level=ThreadLevel.MEDIUM,
+            )
+            thread = self._release_thread
+        thread.start()
+
+    def _release_cycle(self, allow_exit: bool = True) -> ThreadRunSummary:
+        """Advance every pending release by one step.
+
+        Drained entries are unmapped. One still busy after the drain grace
+        has its pending imported events force-completed; one still busy after
+        the stuck timeout is reported and, with ``stuck_action="exit"``,
+        terminates the server.
+
+        Args:
+            allow_exit: False during shutdown, which must never exit early.
+
+        Returns:
+            A summary of this cycle.
+        """
+        cfg = self._release_config
+        now = time.monotonic()
+        with self._release_lock:
+            pending = list(self._pending_releases.values())
+        ready_ids: list[int] = []
+        stuck: list[_PendingRelease] = []
+        for item in pending:
+            if self._stream_drained(item.entry):
+                ready_ids.append(item.instance_id)
+            elif item.forced_at is None:
+                if now - item.started >= cfg.drain_grace_seconds:
+                    self._force_release(item, now)
+            elif now - item.forced_at >= cfg.stuck_timeout_seconds:
+                stuck.append(item)
+        if pending:
+            del item
+        del pending
+        newly_stuck = [p for p in stuck if not p.stuck]
+        for p in newly_stuck:
+            p.stuck = True
+            logger.error(
+                "IPC release of instance %d is stuck: its stream has not drained "
+                "%.0fs after its imported events were forced. Its KV mappings "
+                "stay held until the server restarts.",
+                p.instance_id,
+                now - p.started,
+            )
+        if newly_stuck:
+            del p
+        num_stuck = len(stuck)
+        del stuck, newly_stuck
+        with self._release_lock:
+            ready = [self._pending_releases.pop(i).entry for i in ready_ids]
+            for iid in ready_ids:
+                if iid in self._poisoned:
+                    self._poisoned[iid] = now
+            # Commit callbacks of a finished release are long drained by now.
+            for iid, done in list(self._poisoned.items()):
+                if done is not None and now - done > _POISON_RETENTION_SECONDS:
+                    del self._poisoned[iid]
+            remaining = len(self._pending_releases)
+        self._finalize_releases(ready)
+        if num_stuck and allow_exit and cfg.stuck_action == "exit":
+            self._exit_for_stuck_release(num_stuck)
+        return ThreadRunSummary(
+            success=num_stuck == 0,
+            message=(
+                f"released={len(ready_ids)} pending={remaining} stuck={num_stuck}"
+            ),
+        )
+
+    def _force_release(self, item: _PendingRelease, now: float) -> None:
+        """Force-complete the imported events a pending release waits on.
+
+        The instance is poisoned first, so any store whose copy the force lets
+        run is not committed.
+
+        Args:
+            item: The pending release; marked as forced.
+            now: Current ``time.monotonic()``.
+        """
+        item.forced_at = now
+        with self._release_lock:
+            self._poisoned.setdefault(item.instance_id, None)
+        cache_context = item.entry.cache_context
+        held = getattr(cache_context, "held_imported_events", None)
+        events = held() if held is not None else []
+        force = getattr(item.entry.event_backend, "force_complete_events", None)
+        if force is None:
+            with self._release_lock:
+                self._release_counters["unforceable"] += 1
+            logger.error(
+                "IPC release of instance %d: stream still busy after %.0fs and "
+                "the %s event backend cannot complete events for a dead peer. "
+                "Run server and workers with isolated IPC (--isolated-ipc / "
+                "lmcache.mp.isolated_ipc) so stuck waits can be released.",
+                item.instance_id,
+                now - item.started,
+                type(item.entry.event_backend).__name__,
+            )
+            return
+        try:
+            slots = force(events)
+        except Exception:
+            logger.exception(
+                "Force-completing events of instance %d failed", item.instance_id
+            )
+            return
+        with self._release_lock:
+            self._release_counters["forced"] += 1
+        logger.warning(
+            "IPC release of instance %d: stream still busy after %.0fs; "
+            "force-completed %d semaphore slot(s) of the dead worker. Its "
+            "in-flight stores are dropped, not committed.",
+            item.instance_id,
+            now - item.started,
+            slots,
+        )
+
+    def _exit_for_stuck_release(self, num_stuck: int) -> None:
+        """Terminate the server so a restart reclaims stuck mappings.
+
+        Process exit is the one thing that always unmaps IPC memory. Uses
+        ``os._exit`` because a normal shutdown would block on the same stuck
+        streams.
+
+        Args:
+            num_stuck: Number of stuck releases, for the log line.
+        """
+        logger.critical(
+            "Exiting with code %d: %d IPC release(s) stuck and "
+            "--ipc-release-stuck-action=exit. The restart frees their GPU memory.",
+            STUCK_RELEASE_EXIT_CODE,
+            num_stuck,
+        )
+        try:
+            logging.shutdown()
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            os._exit(STUCK_RELEASE_EXIT_CODE)
+
+    def release_status(self) -> dict:
+        """Return counters and pending state of the IPC release path.
+
+        Returns:
+            A dict with the pending/stuck instance IDs and lifetime counters.
+        """
+        with self._release_lock:
+            pending = list(self._pending_releases.values())
+            status: dict[str, Any] = dict(self._release_counters)
+            status["pending_instance_ids"] = [p.instance_id for p in pending]
+            status["stuck_instance_ids"] = [p.instance_id for p in pending if p.stuck]
+            status["stuck_action"] = self._release_config.stuck_action
+        return status
 
     def report_status(self) -> dict:
         """Return GPU transfer module status information.
@@ -424,18 +786,49 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         return {
             "registered_gpu_ids": registered_gpu_ids,
             "cache_context_meta": cache_context_meta,
+            "ipc_release": self.release_status(),
         }
 
     def close(self) -> None:
-        """Release GPU resources owned by this module."""
+        """Release GPU resources owned by this module.
+
+        Pending releases get one bounded attempt: their imported events are
+        forced right away (the server is going down, so no grace), and any
+        stream still busy after the stuck timeout is left mapped for process
+        exit to reclaim instead of hanging shutdown.
+        """
         # Stop the drain thread before storage_manager.close() so any
         # in-flight completions reach a live storage manager.
         self._device_host_func_dispatcher.stop()
+        with self._release_lock:
+            self._closing = True
+            release_thread = self._release_thread
+        if release_thread is not None:
+            release_thread.stop()
 
         with self._lock:
-            entries = list(self._cache_contexts.values())
+            released = list(self._cache_contexts.items())
             self._cache_contexts.clear()
-        self._release_entries(entries)
+        self._release_entries(released)
+
+        cfg = self._release_config
+        with self._release_lock:
+            for item in self._pending_releases.values():
+                item.started -= cfg.drain_grace_seconds
+        deadline = time.monotonic() + cfg.stuck_timeout_seconds
+        while True:
+            self._release_cycle(allow_exit=False)
+            with self._release_lock:
+                leftover = sorted(self._pending_releases)
+            if not leftover or time.monotonic() >= deadline:
+                break
+            time.sleep(cfg.poll_interval_seconds)
+        if leftover:
+            logger.error(
+                "Shutting down with IPC release(s) still stuck for instance(s) "
+                "%s; process exit reclaims their mappings.",
+                leftover,
+            )
 
     @request_handler()
     def register_kv_cache(
@@ -549,7 +942,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
         # No scalar binding: `popped` must stay the only reference so
         # _release_entries' reclaim actually unmaps the IPC segments.
-        self._release_entries(popped)
+        self._release_entries([(instance_id, popped.pop())])
         logger.info("Unregistered KV cache for GPU ID %d", instance_id)
 
     @request_handler(
@@ -805,8 +1198,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 if stored_count:
                     submit_callback_to_stream(
                         cache_context.cupy_stream,
-                        "finish_write_by_owner",
-                        completion,
+                        "finish_write_unless_poisoned",
+                        (instance_id, completion),
                     )
                 else:
                     total_bytes = 0

@@ -168,8 +168,11 @@ def test_store_owner_callback_round_trip(
         else:
             assert order == ["callback", "copy", "copy", "record", "callback"]
             kind, encoded = queued[1]
-            assert kind == "finish_write_by_owner"
-            payload = msgspec.msgpack.decode(encoded, type=L1WriteCompletion)
+            assert kind == "finish_write_unless_poisoned"
+            instance_id, payload = msgspec.msgpack.decode(
+                encoded, type=tuple[int, L1WriteCompletion]
+            )
+            assert instance_id == 1
             assert payload == [
                 (manager.l1_manager_id, keys if owner_count == 1 else [keys[index]])
                 for index, manager in enumerate(managers)

@@ -493,6 +493,65 @@ class TimelineSemaphoreEventIPCBackend:
             return True
         return self._read_slot(event) >= event.seq
 
+    def force_complete_events(self, events: list[object]) -> int:
+        """Signal imported events on behalf of an exporter that will never do it.
+
+        A ``cuStreamWaitValue64`` queued on an imported event blocks its stream
+        until the exporter writes the slot. When the exporter has died, nothing
+        ever will, and the stream -- plus every unmap that needs it drained --
+        is stuck for the life of the process. Unlike a CUDA interprocess event,
+        a semaphore slot is plain device memory this process has mapped, so it
+        can write the awaited sequence itself and let those waits retire.
+
+        Only call this for an exporter known to be gone: completing a live
+        exporter's event early lets queued transfers run before its data is
+        ready.
+
+        Args:
+            events: Events whose stream waits may still be pending. Local and
+                never-recorded events are skipped.
+
+        Returns:
+            The number of semaphore slots written.
+
+        Raises:
+            RuntimeError: If a driver call fails.
+        """
+        # One write per slot, at the highest awaited sequence: waits are GEQ,
+        # so it releases every lower one too. 64-bit sequences never wrap in
+        # practice, so a plain max is the right order.
+        targets: dict[tuple[int, int], int] = {}
+        for event in events:
+            if (
+                not isinstance(event, TimelineSemaphoreEvent)
+                or event.origin is not TimelineSemaphoreEventOrigin.IMPORTED
+                or event.seq == _UNRECORDED_SEQ
+            ):
+                continue
+            slot = (event.device_index, event.base_ptr + event.slot_offset)
+            targets[slot] = max(targets.get(slot, _UNRECORDED_SEQ), event.seq)
+        for (device_index, slot_ptr), seq in targets.items():
+            # The buffer's host-ops stream never waits on anything, so this
+            # write cannot queue behind the stuck stream it is meant to free.
+            buffer_stream: object = self._get_buffer(device_index).buffer_ops_stream
+            with torch.cuda.device(device_index):
+                _CHECK_CUDA(
+                    _cuda.driver.cuStreamWriteValue64(
+                        _cuda.driver.CUstream(
+                            _raw_stream_handle(buffer_stream, device_index)
+                        ),
+                        _cuda.driver.CUdeviceptr(slot_ptr),
+                        seq,
+                        _cuda.driver.CUstreamWriteValue_flags.CU_STREAM_WRITE_VALUE_DEFAULT,
+                    ),
+                    "cuStreamWriteValue64 (force complete)",
+                )
+                _CHECK_CUDA(
+                    _cuda.runtime.cudaStreamSynchronize(buffer_stream),
+                    "cudaStreamSynchronize (force complete)",
+                )
+        return len(targets)
+
     def synchronize_event(self, event: object, device: object) -> None:
         """Block the host until ``event`` completes.
 

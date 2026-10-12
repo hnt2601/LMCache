@@ -41,6 +41,7 @@ def _bare_gpu_module() -> LMCacheDrivenTransferModule:
     module._ctx = MagicMock(name="ctx")
     module._cache_contexts = {}
     module._lock = threading.Lock()
+    module._init_release_state()
     return module
 
 

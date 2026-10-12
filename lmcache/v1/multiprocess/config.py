@@ -136,6 +136,20 @@ class MPServerConfig:
     sent a PING (model warmup, or death before its first request). Must be
     >= worker_reap_timeout_seconds."""
 
+    ipc_release_drain_grace_seconds: float = 30.0
+    """How long a released instance's transfer stream may stay busy before the
+    server force-completes the imported events it waits on. Only the
+    timeline-semaphore backend (isolated IPC) can force them."""
+
+    ipc_release_stuck_timeout_seconds: float = 60.0
+    """How long a stream may stay busy after forcing before the release counts
+    as stuck and ipc_release_stuck_action applies."""
+
+    ipc_release_stuck_action: Literal["quarantine", "exit"] = "quarantine"
+    """What to do with a stuck release: 'quarantine' keeps its KV mappings
+    held and reports it in /status; 'exit' terminates the server so the
+    container restarts and the driver frees the memory."""
+
     enable: list[str] = field(default_factory=list)
     """List of experimental transfer modules to enable. Options: transfer_query
     (see lmcache.v1.multiprocess.modules.experimental.__init___.py)."""
@@ -172,6 +186,18 @@ class MPServerConfig:
             raise ValueError(
                 "worker registration grace must be >= the worker reap timeout "
                 f"({reap}s); got {grace}"
+            )
+        for name in (
+            "ipc_release_drain_grace_seconds",
+            "ipc_release_stuck_timeout_seconds",
+        ):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be a positive number; got {value}")
+        if self.ipc_release_stuck_action not in ("quarantine", "exit"):
+            raise ValueError(
+                "ipc_release_stuck_action must be 'quarantine' or 'exit'; got "
+                f"{self.ipc_release_stuck_action!r}"
             )
 
 
@@ -527,6 +553,29 @@ def add_mp_server_args(
         "timeout. Default is 3600.",
     )
     mp_group.add_argument(
+        "--ipc-release-drain-grace-seconds",
+        type=float,
+        default=30.0,
+        help="How long (s) a released worker's transfer stream may stay busy "
+        "before its pending imported events are force-completed (isolated "
+        "IPC only). Default is 30.",
+    )
+    mp_group.add_argument(
+        "--ipc-release-stuck-timeout-seconds",
+        type=float,
+        default=60.0,
+        help="How long (s) a stream may stay busy after forcing before the "
+        "release counts as stuck. Default is 60.",
+    )
+    mp_group.add_argument(
+        "--ipc-release-stuck-action",
+        choices=["quarantine", "exit"],
+        default="quarantine",
+        help="What to do with a stuck release: 'quarantine' keeps the KV "
+        "mappings held and reports them in /status; 'exit' terminates the "
+        "server so its restart frees the GPU memory. Default is quarantine.",
+    )
+    mp_group.add_argument(
         "--enable-segmented-prefix",
         action="store_true",
         help="CacheBlend (--engine-type blend) only: on a mid-prefix L2 "
@@ -617,6 +666,9 @@ def parse_args_to_mp_server_config(
         worker_reap_timeout_seconds=args.worker_reap_timeout_seconds,
         session_ttl_seconds=args.session_ttl_seconds,
         worker_registration_grace_seconds=args.worker_registration_grace_seconds,
+        ipc_release_drain_grace_seconds=args.ipc_release_drain_grace_seconds,
+        ipc_release_stuck_timeout_seconds=args.ipc_release_stuck_timeout_seconds,
+        ipc_release_stuck_action=args.ipc_release_stuck_action,
         enable=args.enable or [],
         server_modules=parse_server_module_specs(args.server_module or []),
     )

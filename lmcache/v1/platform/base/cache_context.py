@@ -102,6 +102,20 @@ class BaseCacheContext(ABC):
         with self._held_imports_lock:
             self._held_imports.pop(token, None)
 
+    def held_imported_events(self) -> list[object]:
+        """Return the imported events whose stream waits may still be pending.
+
+        Used on teardown to find what a stuck stream is waiting for. Entries
+        whose release callback was skipped (the instance was already
+        unregistered) are included too; they are complete, so signalling them
+        again is harmless.
+
+        Returns:
+            A snapshot list of the held events.
+        """
+        with self._held_imports_lock:
+            return list(self._held_imports.values())
+
     # ------------------------------------------------------------------
     # Abstract -- subclasses MUST implement
     # ------------------------------------------------------------------
