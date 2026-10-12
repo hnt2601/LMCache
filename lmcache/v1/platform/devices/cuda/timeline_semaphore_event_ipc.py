@@ -505,11 +505,12 @@ class TimelineSemaphoreEventIPCBackend:
 
         Only call this for an exporter known to be gone: completing a live
         exporter's event early lets queued transfers run before its data is
-        ready.
+        ready. Safe to call repeatedly; already-satisfied slots are skipped.
 
         Args:
             events: Events whose stream waits may still be pending. Local and
-                never-recorded events are skipped.
+                never-recorded events, and imports that resolved to one of
+                this process's own buffers, are skipped.
 
         Returns:
             The number of semaphore slots written.
@@ -517,20 +518,30 @@ class TimelineSemaphoreEventIPCBackend:
         Raises:
             RuntimeError: If a driver call fails.
         """
+        with _HANDLE_REGISTRY_LOCK:
+            own_bases = set(_LOCAL_BUFFERS_BY_HANDLE.values())
         # One write per slot, at the highest awaited sequence: waits are GEQ,
         # so it releases every lower one too. 64-bit sequences never wrap in
         # practice, so a plain max is the right order.
-        targets: dict[tuple[int, int], int] = {}
+        targets: dict[tuple[int, int], TimelineSemaphoreEvent] = {}
         for event in events:
             if (
                 not isinstance(event, TimelineSemaphoreEvent)
                 or event.origin is not TimelineSemaphoreEventOrigin.IMPORTED
                 or event.seq == _UNRECORDED_SEQ
+                or event.base_ptr in own_bases
             ):
                 continue
             slot = (event.device_index, event.base_ptr + event.slot_offset)
-            targets[slot] = max(targets.get(slot, _UNRECORDED_SEQ), event.seq)
-        for (device_index, slot_ptr), seq in targets.items():
+            current = targets.get(slot)
+            if current is None or event.seq > current.seq:
+                targets[slot] = event
+        written = 0
+        for (device_index, slot_ptr), event in targets.items():
+            # Never move a slot backwards: if the exporter (were it alive) has
+            # already recorded past the target, the wait is satisfied anyway.
+            if self._read_slot(event) >= event.seq:
+                continue
             # The buffer's host-ops stream never waits on anything, so this
             # write cannot queue behind the stuck stream it is meant to free.
             buffer_stream: object = self._get_buffer(device_index).buffer_ops_stream
@@ -541,7 +552,7 @@ class TimelineSemaphoreEventIPCBackend:
                             _raw_stream_handle(buffer_stream, device_index)
                         ),
                         _cuda.driver.CUdeviceptr(slot_ptr),
-                        seq,
+                        event.seq,
                         _cuda.driver.CUstreamWriteValue_flags.CU_STREAM_WRITE_VALUE_DEFAULT,
                     ),
                     "cuStreamWriteValue64 (force complete)",
@@ -550,7 +561,8 @@ class TimelineSemaphoreEventIPCBackend:
                     _cuda.runtime.cudaStreamSynchronize(buffer_stream),
                     "cudaStreamSynchronize (force complete)",
                 )
-        return len(targets)
+            written += 1
+        return written
 
     def synchronize_event(self, event: object, device: object) -> None:
         """Block the host until ``event`` completes.

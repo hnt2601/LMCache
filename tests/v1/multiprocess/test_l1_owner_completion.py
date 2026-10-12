@@ -133,7 +133,10 @@ def test_store_owner_callback_round_trip(
         object_groups=[ObjectGroupInfo(kernel_group_indices=[i]) for i in range(2)],
     )
     entry = SimpleNamespace(
-        cache_context=cache_context, model_name="model", event_backend=backend
+        cache_context=cache_context,
+        model_name="model",
+        event_backend=backend,
+        generation=1,
     )
     monkeypatch.setattr(module, "get_and_touch_context_entry", lambda _: entry)
     try:
@@ -169,10 +172,10 @@ def test_store_owner_callback_round_trip(
             assert order == ["callback", "copy", "copy", "record", "callback"]
             kind, encoded = queued[1]
             assert kind == "finish_write_unless_poisoned"
-            instance_id, payload = msgspec.msgpack.decode(
+            generation, payload = msgspec.msgpack.decode(
                 encoded, type=tuple[int, L1WriteCompletion]
             )
-            assert instance_id == 1
+            assert generation == 1
             assert payload == [
                 (manager.l1_manager_id, keys if owner_count == 1 else [keys[index]])
                 for index, manager in enumerate(managers)

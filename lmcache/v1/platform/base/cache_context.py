@@ -16,6 +16,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, ClassVar
 import array
 import threading
+import time
 
 # Third Party
 import torch
@@ -71,6 +72,9 @@ class BaseCacheContext(ABC):
         # Imported worker events, held until the stream wait queued on each
         # has been consumed (see hold_imported_event / release_imported_event).
         self._held_imports: dict[int, object] = {}
+        # time.monotonic() at hold, by token; lets teardown tell how long the
+        # oldest queued wait has been pending (see held_imports_snapshot).
+        self._held_import_times: dict[int, float] = {}
         self._next_import_token = 0
         self._held_imports_lock = threading.Lock()
 
@@ -91,6 +95,7 @@ class BaseCacheContext(ABC):
             token = self._next_import_token
             self._next_import_token += 1
             self._held_imports[token] = event
+            self._held_import_times[token] = time.monotonic()
             return token
 
     def release_imported_event(self, token: int) -> None:
@@ -101,9 +106,10 @@ class BaseCacheContext(ABC):
         """
         with self._held_imports_lock:
             self._held_imports.pop(token, None)
+            self._held_import_times.pop(token, None)
 
-    def held_imported_events(self) -> list[object]:
-        """Return the imported events whose stream waits may still be pending.
+    def held_imports_snapshot(self) -> tuple[list[object], float | None]:
+        """Return the held imported events and when the oldest was held.
 
         Used on teardown to find what a stuck stream is waiting for. Entries
         whose release callback was skipped (the instance was already
@@ -111,10 +117,13 @@ class BaseCacheContext(ABC):
         again is harmless.
 
         Returns:
-            A snapshot list of the held events.
+            ``(events, oldest_hold_time)``; the time is ``time.monotonic()``
+            of the oldest hold, or None when nothing is held.
         """
         with self._held_imports_lock:
-            return list(self._held_imports.values())
+            events = list(self._held_imports.values())
+            oldest = min(self._held_import_times.values(), default=None)
+        return events, oldest
 
     # ------------------------------------------------------------------
     # Abstract -- subclasses MUST implement
