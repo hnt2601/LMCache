@@ -285,6 +285,8 @@ class _PendingRelease:
     force_blocked: str | None = None
     #: Set once "nothing_held" has been reported, to log and count it once.
     reported_nothing_held: bool = False
+    #: Set once "the instance re-registered, so not forced" has been logged.
+    reported_reregistered: bool = False
     #: Forces that raised so far, and when the next one may be tried.
     force_failures: int = 0
     force_retry_at: float | None = None
@@ -1193,12 +1195,30 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         lets run is not committed. Forcing is refused (and the release left to
         the stuck path) when the backend cannot force, or when the oldest
         pending wait is older than the force age limit: its STORE's L1
-        reservation may have expired and been handed to another key.
+        reservation may have expired and been handed to another key. Skipped
+        while the instance is registered again (see below).
 
         Args:
             item: The pending release.
             now: Current ``time.monotonic()``.
         """
+        with self._lock:
+            current = self._cache_contexts.get(item.instance_id)
+        if current is not None and current.generation != item.entry.generation:
+            # Re-registered (falsely reaped): the exporter is alive, so its
+            # next record on the slot completes these waits. Forcing would
+            # write an old sequence into its live slot (stalling newer waits)
+            # and let old RETRIEVE copies land in KV it is using.
+            if not item.reported_reregistered:
+                item.reported_reregistered = True
+                logger.warning(
+                    "IPC release of instance %d: stream still busy after %.0fs, "
+                    "but the instance registered again, so it is alive; not "
+                    "forcing",
+                    item.instance_id,
+                    now - item.started,
+                )
+            return
         force = getattr(item.entry.event_backend, "force_complete_events", None)
         snapshot = getattr(item.entry.cache_context, "held_imports_snapshot", None)
         events, oldest = snapshot() if snapshot is not None else ([], None)

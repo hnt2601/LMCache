@@ -341,6 +341,38 @@ def test_reregistered_instance_is_not_poisoned(monkeypatch, clock, dev) -> None:
     storage.finish_write_by_owner.assert_called_once_with([(0, ["fresh"])])
 
 
+def test_release_of_a_reregistered_instance_is_not_forced(
+    monkeypatch, clock, dev
+) -> None:
+    """A falsely reaped worker that re-registered is alive: its old waits
+    complete on their own. Forcing would write an old sequence into its live
+    semaphore slot and let old RETRIEVE copies land in KV it is using. Once
+    the new registration is gone too, forcing resumes."""
+    module = _module(monkeypatch, grace=30.0)
+    old_stream = _Stream(drained=False)
+    old_backend = _ForcingBackend(old_stream)
+    ctx_old = _register(module, monkeypatch, clock, 1, old_stream, old_backend)
+    old_gen = _generation(module, 1)
+    module.unregister_kv_cache(1)
+    new_stream = _Stream(drained=True)
+    _register(module, monkeypatch, clock, 1, new_stream, _ForcingBackend(new_stream))
+
+    clock.now += 31.0
+    module._release_cycle()
+    clock.now += 5.0
+    module._release_cycle()
+    assert old_backend.forced == []
+    storage = module.context.storage_manager
+    module._finish_write_unless_poisoned((old_gen, [(0, ["k"])]))
+    storage.finish_write_by_owner.assert_called_once_with([(0, ["k"])])
+
+    module.unregister_kv_cache(1)  # the live registration goes away too
+    module._release_cycle()
+    assert old_backend.forced == [["event-1"]]
+    module._release_cycle()
+    ctx_old.close.assert_called_once()
+
+
 def test_same_instance_released_twice_closes_both(monkeypatch, clock, dev) -> None:
     module = _module(monkeypatch)
     stream1 = _Stream(drained=False)
