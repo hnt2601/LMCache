@@ -966,6 +966,47 @@ def test_submit_retrieve_request_tracks_returned_future(fake_adapter, monkeypatc
 
 
 @pytest.mark.parametrize(
+    "method_name, ctx_method",
+    [
+        ("submit_store_request", "submit_store"),
+        ("submit_retrieve_request", "submit_retrieve"),
+    ],
+)
+def test_submit_never_uses_a_recovery_context_still_registering(
+    fake_adapter, monkeypatch, method_name, ctx_method
+):
+    """The heartbeat re-registers while the forward step is submitting: it
+    clears health, then publishes the new transfer context before register()
+    returns. A submit that passed its health check just before must not pick
+    up that unregistered context (it raises, killing the forward step)."""
+    adapter, _send_mock, _ = fake_adapter
+    monkeypatch.setattr(adapter, "_ensure_heartbeat_started", lambda: None)
+    fake_tensor = MagicMock()
+    fake_tensor.device.type = "cuda"
+    adapter.kv_caches = {"layer.0": fake_tensor}
+    registered = MagicMock(name="registered_ctx")
+    recovering = MagicMock(name="recovering_ctx")
+    getattr(recovering, ctx_method).side_effect = RuntimeError(
+        "LMCache-driven transfer context is not registered."
+    )
+    adapter.transfer_ctx = registered
+    create_key = adapter._create_key
+
+    def heartbeat_recovers_meanwhile(*args, **kwargs):
+        adapter._health_event.clear()
+        adapter.transfer_ctx = recovering
+        return create_key(*args, **kwargs)
+
+    monkeypatch.setattr(adapter, "_create_key", heartbeat_recovers_meanwhile)
+    op = LoadStoreOp(token_ids=[1, 2, 3, 4], block_ids=[[0]], start=0, end=4)
+
+    getattr(adapter, method_name)("req-1", op, event=MagicMock())
+
+    getattr(registered, ctx_method).assert_called_once()
+    getattr(recovering, ctx_method).assert_not_called()
+
+
+@pytest.mark.parametrize(
     "method_name",
     ["batched_submit_store_requests", "batched_submit_retrieve_requests"],
 )

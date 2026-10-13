@@ -1880,6 +1880,10 @@ class LMCacheMPWorkerAdapter:
                 self._completed_store_requests[request_id] = 1
             return
 
+        # Read before the health check: recovery clears health before it
+        # publishes a context still registering, so a context read here and
+        # then found healthy is a registered one.
+        transfer_ctx = self.transfer_ctx
         if not self.is_healthy:
             if self.lazy_offload:
                 logger.warning(
@@ -1901,12 +1905,12 @@ class LMCacheMPWorkerAdapter:
             cache_salt=cache_salt,
             request_configs=request_configs,
         )
-        if self.transfer_ctx is None:
+        if transfer_ctx is None:
             raise RuntimeError(
                 "Transfer context is not initialized. "
                 "Call register_kv_caches() before submitting store requests."
             )
-        future = self.transfer_ctx.submit_store(
+        future = transfer_ctx.submit_store(
             request_id,
             key,
             self.kv_caches,
@@ -1949,6 +1953,8 @@ class LMCacheMPWorkerAdapter:
         """
         self._ensure_heartbeat_started()
 
+        # Read before the health check; see submit_store_request.
+        transfer_ctx = self.transfer_ctx
         if not self.is_healthy:
             self.error_block_ids.update(op.flat_block_ids)
             self._failed_request_ids.add(request_id)
@@ -1964,12 +1970,12 @@ class LMCacheMPWorkerAdapter:
             cache_salt=cache_salt,
             request_configs=request_configs,
         )
-        if self.transfer_ctx is None:
+        if transfer_ctx is None:
             raise RuntimeError(
                 "Transfer context is not initialized. "
                 "Call register_kv_caches() before submitting retrieve requests."
             )
-        future = self.transfer_ctx.submit_retrieve(
+        future = transfer_ctx.submit_retrieve(
             request_id,
             key,
             self.kv_caches,
@@ -2452,9 +2458,11 @@ class LMCacheMPWorkerAdapter:
         """
         if not need_flush_before_forward:
             return
-        if not self.is_healthy or self.transfer_ctx is None:
+        # Read before the health check; see submit_store_request.
+        transfer_ctx = self.transfer_ctx
+        if not self.is_healthy or transfer_ctx is None:
             return
-        self.transfer_ctx.flush_inflight_stores()
+        transfer_ctx.flush_inflight_stores()
         # Force device sync here, compare to preemption, perf panelty is trivial
         torch_dev.synchronize()
 
