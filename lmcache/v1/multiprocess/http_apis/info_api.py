@@ -49,6 +49,8 @@ async def healthcheck(request: Request) -> Any:
         - The request loop is not stuck (when
           ``--mq-loop-stall-unhealthy-seconds`` is set and the transport
           reports its loop progress)
+        - No IPC release has been stuck too long (when
+          ``--ipc-release-stuck-unhealthy-seconds`` is set)
     """
     engine = getattr(request.app.state, "engine", None)
     if engine is None:
@@ -74,6 +76,19 @@ async def healthcheck(request: Request) -> Any:
                 content={
                     "status": "unhealthy",
                     "reason": f"MQ main loop stalled for {stall:.0f}s",
+                },
+            )
+
+    limit = getattr(request.app.state, "ipc_release_stuck_unhealthy_seconds", 0.0)
+    stuck_fn = getattr(engine, "stuck_ipc_release_seconds", None)
+    if isinstance(limit, (int, float)) and limit > 0 and callable(stuck_fn):
+        stuck = stuck_fn()
+        if stuck is not None and stuck > limit:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "unhealthy",
+                    "reason": f"IPC release stuck for {stuck:.0f}s",
                 },
             )
 

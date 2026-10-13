@@ -167,6 +167,20 @@ class MPCacheServer:
                 }
         return None
 
+    def stuck_ipc_release_seconds(self) -> float | None:
+        """Used by ``/healthcheck``: longest time an IPC release is stuck.
+
+        Returns:
+            Seconds, or None when nothing is stuck.
+        """
+        stuck = [
+            seconds
+            for module in self._modules
+            if isinstance(module, LMCacheDrivenTransferModule)
+            and (seconds := module.stuck_release_seconds()) is not None
+        ]
+        return max(stuck) if stuck else None
+
     def clear(self, force: bool = False) -> None:
         """Used by ``/cache/clear``; delegates to :class:`ManagementModule`."""
         for module in self._modules:

@@ -442,3 +442,37 @@ def test_config_rejects_negative_mq_loop_stall() -> None:
     with pytest.raises(ValueError, match="mq_loop_stall_unhealthy_seconds"):
         MPServerConfig(mq_loop_stall_unhealthy_seconds=-1.0)
     assert MPServerConfig().mq_loop_stall_unhealthy_seconds == 0.0
+
+
+def test_healthcheck_reports_a_stuck_ipc_release() -> None:
+    """--ipc-release-stuck-unhealthy-seconds gives quarantine a bounded end:
+    liveness restarts the server, and the restart frees the held VRAM."""
+    stuck = SimpleNamespace(stuck_ipc_release_seconds=lambda: 700.0)
+    base = {"engine": stuck}
+
+    response = _healthcheck({**base, "ipc_release_stuck_unhealthy_seconds": 600.0})
+    assert response.status_code == 503
+    assert b"IPC release stuck for 700s" in response.body
+
+    assert _healthcheck({**base, "ipc_release_stuck_unhealthy_seconds": 900.0}) == {
+        "status": "healthy"
+    }
+    # Disabled (default 0) or unset.
+    assert _healthcheck({**base, "ipc_release_stuck_unhealthy_seconds": 0.0}) == {
+        "status": "healthy"
+    }
+    assert _healthcheck(base) == {"status": "healthy"}
+    # Nothing stuck, or an engine without IPC release tracking.
+    not_stuck = SimpleNamespace(stuck_ipc_release_seconds=lambda: None)
+    assert _healthcheck(
+        {"engine": not_stuck, "ipc_release_stuck_unhealthy_seconds": 1.0}
+    ) == {"status": "healthy"}
+    assert _healthcheck(
+        {"engine": object(), "ipc_release_stuck_unhealthy_seconds": 1.0}
+    ) == {"status": "healthy"}
+
+
+def test_config_rejects_negative_ipc_release_stuck_unhealthy() -> None:
+    with pytest.raises(ValueError, match="ipc_release_stuck_unhealthy_seconds"):
+        MPServerConfig(ipc_release_stuck_unhealthy_seconds=-1.0)
+    assert MPServerConfig().ipc_release_stuck_unhealthy_seconds == 0.0

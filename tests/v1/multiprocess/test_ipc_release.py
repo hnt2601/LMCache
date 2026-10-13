@@ -882,6 +882,48 @@ def test_failed_force_is_retried_with_backoff(monkeypatch, clock, dev) -> None:
     assert status["pending_instance_ids"] == []
 
 
+def test_stuck_duration_is_reported_and_clears_on_force(
+    monkeypatch, clock, dev
+) -> None:
+    """How long a release has been stuck drives the /healthcheck escape hatch
+    (--ipc-release-stuck-unhealthy-seconds); a later successful force (after
+    retries) clears it."""
+    module = _module(monkeypatch, grace=30.0, stuck=60.0)
+    stream = _Stream(drained=False)
+    backend = _ForcingBackend(stream)
+    real_force = backend.force_complete_events
+    broken = {"value": True}
+
+    def force(events: list[object]) -> int:
+        if broken["value"]:
+            raise RuntimeError("driver error")
+        return real_force(events)
+
+    backend.force_complete_events = force
+    ctx = _register(module, monkeypatch, clock, 1, stream, backend)
+    module.unregister_kv_cache(1)
+    assert module.stuck_release_seconds() is None
+
+    clock.now += 31.0
+    module._release_cycle()
+    clock.now += 60.0
+    module._release_cycle()  # stuck since now
+    clock.now += 45.0
+    module._release_cycle()
+    assert module.stuck_release_seconds() == 45.0
+    status = module.release_status()
+    assert status["stuck"] == 1
+    assert status["stuck_seconds"] == 45.0
+
+    broken["value"] = False
+    clock.now += 60.0
+    module._release_cycle()  # retry forces; no longer stuck
+    assert module.stuck_release_seconds() is None
+    assert module.release_status()["stuck_instance_ids"] == []
+    module._release_cycle()
+    ctx.close.assert_called_once()
+
+
 def test_stuck_release_exits_when_configured(monkeypatch, clock, dev) -> None:
     module = _module(monkeypatch, grace=1.0, stuck=1.0, action="exit")
     stream = _Stream(drained=False)

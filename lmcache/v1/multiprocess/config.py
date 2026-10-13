@@ -155,6 +155,13 @@ class MPServerConfig:
     held and reports it in /status; 'exit' terminates the server so the
     container restarts and the driver frees the memory."""
 
+    ipc_release_stuck_unhealthy_seconds: float = 0.0
+    """Report /healthcheck unhealthy (503) once an IPC release has been stuck
+    longer than this, so a liveness probe restarts the server and the restart
+    frees the GPU memory a quarantined release (and every release held back
+    on its GPU) keeps mapped. Gives 'quarantine' a bounded end. 0 disables
+    the check."""
+
     mq_loop_stall_unhealthy_seconds: float = 0.0
     """Report /healthcheck unhealthy (503) once the MQ main loop has been stuck
     in one iteration longer than this, so a liveness probe restarts a server
@@ -206,12 +213,13 @@ class MPServerConfig:
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be a positive number; got {value}")
-        stall = self.mq_loop_stall_unhealthy_seconds
-        if not math.isfinite(stall) or stall < 0:
-            raise ValueError(
-                "mq_loop_stall_unhealthy_seconds must be a non-negative number; "
-                f"got {stall}"
-            )
+        for name in (
+            "mq_loop_stall_unhealthy_seconds",
+            "ipc_release_stuck_unhealthy_seconds",
+        ):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be a non-negative number; got {value}")
         if self.ipc_release_stuck_action not in ("quarantine", "exit"):
             raise ValueError(
                 "ipc_release_stuck_action must be 'quarantine' or 'exit'; got "
@@ -602,6 +610,14 @@ def add_mp_server_args(
         "server so its restart frees the GPU memory. Default is quarantine.",
     )
     mp_group.add_argument(
+        "--ipc-release-stuck-unhealthy-seconds",
+        type=float,
+        default=0.0,
+        help="Report /healthcheck unhealthy once an IPC release has been stuck "
+        "longer than this (s), so a liveness probe restarts the server and "
+        "frees the GPU memory it holds. Default 0 (disabled).",
+    )
+    mp_group.add_argument(
         "--mq-loop-stall-unhealthy-seconds",
         type=float,
         default=0.0,
@@ -705,6 +721,7 @@ def parse_args_to_mp_server_config(
         ipc_release_stuck_timeout_seconds=args.ipc_release_stuck_timeout_seconds,
         ipc_release_stale_wait_seconds=args.ipc_release_stale_wait_seconds,
         ipc_release_stuck_action=args.ipc_release_stuck_action,
+        ipc_release_stuck_unhealthy_seconds=args.ipc_release_stuck_unhealthy_seconds,
         mq_loop_stall_unhealthy_seconds=args.mq_loop_stall_unhealthy_seconds,
         enable=args.enable or [],
         server_modules=parse_server_module_specs(args.server_module or []),

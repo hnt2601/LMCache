@@ -277,6 +277,8 @@ class _PendingRelease:
     forced_at: float | None = None
     stuck_since: float | None = None
     stuck: bool = False
+    #: When the release last became stuck, or None while it is not.
+    stuck_at: float | None = None
     #: Why the release cannot be forced, once known ("unforceable" backend,
     #: "too_old" waits, "nothing_held"), or None.
     force_blocked: str | None = None
@@ -1101,7 +1103,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 num_stuck += 1
                 if not item.stuck:
                     item.stuck = True
+                    item.stuck_at = now
                     newly_stuck.append((item.instance_id, now - item.stuck_since))
+            elif item.stuck:
+                # A retried force succeeded: counted from that force again.
+                item.stuck = False
+                item.stuck_at = None
         if pending:
             del item
         del pending, drained
@@ -1250,6 +1257,21 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         finally:
             os._exit(STUCK_RELEASE_EXIT_CODE)
 
+    def stuck_release_seconds(self) -> float | None:
+        """Return how long the longest-stuck pending release has been stuck.
+
+        Returns:
+            Seconds since it became stuck, or None when nothing is stuck.
+        """
+        now = time.monotonic()
+        with self._release_lock:
+            stuck_at = [
+                p.stuck_at
+                for p in self._pending_releases.values()
+                if p.stuck_at is not None
+            ]
+        return now - min(stuck_at) if stuck_at else None
+
     def release_status(self) -> dict:
         """Return counters and pending state of the IPC release path.
 
@@ -1263,6 +1285,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             pending = list(self._pending_releases.values())
             status["pending_instance_ids"] = [p.instance_id for p in pending]
             status["stuck_instance_ids"] = [p.instance_id for p in pending if p.stuck]
+            status["stuck"] = len(status["stuck_instance_ids"])
             status["held_back_instance_ids"] = [
                 p.instance_id for p in pending if p.held_back
             ]
@@ -1273,6 +1296,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             status["unmapping"] = self._unmapping
             status["stuck_action"] = self._release_config.stuck_action
             status["max_force_wait_age_seconds"] = self._max_force_wait_age
+        status["stuck_seconds"] = self.stuck_release_seconds()
         status["stale_wait_instance_ids"] = sorted(
             iid
             for ids in self._stale_registered_devices(time.monotonic()).values()
