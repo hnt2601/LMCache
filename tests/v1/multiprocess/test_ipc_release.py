@@ -407,6 +407,47 @@ def test_busy_release_blocks_unmaps_on_its_device_only(monkeypatch, clock, dev) 
     ctx_same.close.assert_called_once()
 
 
+def test_quarantined_release_gates_only_its_gpu(monkeypatch, clock, dev) -> None:
+    """A release stuck for good (here: too old to force) never unmaps, nor
+    does anything held back behind it on its GPU: the unmap would block until
+    the stream drains, which it never will. Releases on other GPUs proceed.
+    empty_cache stays off (it frees cached memory on every GPU, so it would
+    block on the stuck one too). The way out is a restart, via
+    --ipc-release-stuck-unhealthy-seconds or stuck_action=exit."""
+    module = _module(monkeypatch, grace=30.0, stuck=60.0, max_age=1800.0)
+    stuck = _Stream(drained=False)
+    ctx_stuck = _register(
+        module, monkeypatch, clock, 1, stuck, _ForcingBackend(stuck), "cuda:0"
+    )
+    ctx_stuck._holds["value"] = (["e1"], clock.now - 2000.0)
+    module.unregister_kv_cache(1)
+    clock.now += 100.0
+    module._release_cycle()
+    assert module.release_status()["stuck_instance_ids"] == [1]
+
+    same = _Stream(drained=True)
+    ctx_same = _register(
+        module, monkeypatch, clock, 2, same, _ForcingBackend(same), "cuda:0"
+    )
+    other = _Stream(drained=True)
+    ctx_other = _register(
+        module, monkeypatch, clock, 3, other, _ForcingBackend(other), "cuda:1"
+    )
+    module.unregister_kv_cache(2)
+    module.unregister_kv_cache(3)
+    for _ in range(10):
+        clock.now += 3600.0
+        module._release_cycle()
+
+    ctx_other.close.assert_called_once()
+    ctx_stuck.close.assert_not_called()
+    ctx_same.close.assert_not_called()
+    dev.empty_cache.assert_not_called()
+    status = module.release_status()
+    assert status["held_back_instance_ids"] == [2]
+    assert status["stuck_seconds"] == 36000.0
+
+
 def test_stale_wait_on_registered_instance_blocks_its_device(
     monkeypatch, clock, dev
 ) -> None:
