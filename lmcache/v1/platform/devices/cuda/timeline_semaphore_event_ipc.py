@@ -247,6 +247,12 @@ _LOCAL_BUFFERS_BY_HANDLE: dict[bytes, int] = {}
 # Imported buffers by (handle bytes, importer device index); mappings live
 # for the process lifetime (32 KiB each).
 _IMPORTED_BUFFERS_BY_HANDLE: dict[tuple[bytes, int], int] = {}
+# Imports whose cudaIpcOpenMemHandle is in progress, each with an event set
+# when it returns. The open runs OUTSIDE _HANDLE_REGISTRY_LOCK: next to an
+# unmap blocked by a stuck stream on the same GPU it blocks too, and under
+# the lock it would block every import on every GPU and the force that is
+# the only way to unblock that GPU (force_complete_events takes the lock).
+_IMPORTING_BUFFERS: dict[tuple[bytes, int], threading.Event] = {}
 _HANDLE_REGISTRY_LOCK = threading.Lock()
 
 
@@ -493,32 +499,41 @@ class TimelineSemaphoreEventIPCBackend:
             )
         device_index = _resolve_device_index(device)
 
-        # Lock held across the open so two threads importing the same new
-        # handle cannot race it (opening is rare; imports hit the cache).
-        base_ptr: int
-        with _HANDLE_REGISTRY_LOCK:
-            local_base: int | None = _LOCAL_BUFFERS_BY_HANDLE.get(handle_bytes)
-            if local_base is not None:
-                base_ptr = local_base
-            else:
-                cached: int | None = _IMPORTED_BUFFERS_BY_HANDLE.get(
-                    (handle_bytes, device_index)
-                )
-                if cached is not None:
-                    base_ptr = cached
-                else:
-                    ipc_handle = cuda_ipc_handle_from_bytes(handle_bytes)
-                    with torch.cuda.device(device_index):
-                        open_result = _cuda.runtime.cudaIpcOpenMemHandle(
-                            ipc_handle,
-                            _cuda.runtime.cudaIpcMemLazyEnablePeerAccess,
-                        )
-                        _CHECK_CUDA(
-                            open_result, "cudaIpcOpenMemHandle (semaphore buffer)"
-                        )
-                        _err, opened_ptr = open_result
-                        base_ptr = int(opened_ptr)
-                    _IMPORTED_BUFFERS_BY_HANDLE[(handle_bytes, device_index)] = base_ptr
+        # Two threads importing the same new handle open it once: the second
+        # waits for the first's open (opening is rare; imports hit the cache).
+        key = (handle_bytes, device_index)
+        while True:
+            with _HANDLE_REGISTRY_LOCK:
+                base_ptr: int | None = _LOCAL_BUFFERS_BY_HANDLE.get(handle_bytes)
+                if base_ptr is None:
+                    base_ptr = _IMPORTED_BUFFERS_BY_HANDLE.get(key)
+                opening = _IMPORTING_BUFFERS.get(key)
+                if base_ptr is None and opening is None:
+                    done = threading.Event()
+                    _IMPORTING_BUFFERS[key] = done
+            if base_ptr is not None:
+                break
+            if opening is not None:
+                # Look again once it returns: the open may have failed.
+                opening.wait()
+                continue
+            try:
+                ipc_handle = cuda_ipc_handle_from_bytes(handle_bytes)
+                with torch.cuda.device(device_index):
+                    open_result = _cuda.runtime.cudaIpcOpenMemHandle(
+                        ipc_handle,
+                        _cuda.runtime.cudaIpcMemLazyEnablePeerAccess,
+                    )
+                    _CHECK_CUDA(open_result, "cudaIpcOpenMemHandle (semaphore buffer)")
+                    _err, opened_ptr = open_result
+                    base_ptr = int(opened_ptr)
+                with _HANDLE_REGISTRY_LOCK:
+                    _IMPORTED_BUFFERS_BY_HANDLE[key] = base_ptr
+            finally:
+                with _HANDLE_REGISTRY_LOCK:
+                    del _IMPORTING_BUFFERS[key]
+                done.set()
+            break
 
         return TimelineSemaphoreEvent(
             origin=TimelineSemaphoreEventOrigin.IMPORTED,

@@ -1107,6 +1107,103 @@ def test_force_complete_events_writes_max_seq_per_slot(monkeypatch) -> None:
     assert written == 2
 
 
+def _blocking_open_backend(monkeypatch, opens: list[bytes]):
+    """A semaphore backend whose cudaIpcOpenMemHandle blocks until released.
+
+    Returns:
+        ``(backend, entered, release)``: ``entered`` is set once an open is
+        in the driver, ``release`` lets it return.
+    """
+    entered = threading.Event()
+    release = threading.Event()
+
+    def open_handle(handle: bytes, flags: int) -> tuple[int, int]:
+        opens.append(handle)
+        entered.set()
+        release.wait()
+        return (0, 0x7000)
+
+    runtime = SimpleNamespace(
+        cudaIpcOpenMemHandle=open_handle, cudaIpcMemLazyEnablePeerAccess=1
+    )
+    monkeypatch.setattr(ts, "_cuda", SimpleNamespace(driver=None, runtime=runtime))
+    monkeypatch.setattr(ts, "_CHECK_CUDA", lambda result, what: None)
+    monkeypatch.setattr(ts, "cuda_ipc_handle_from_bytes", lambda raw: raw)
+    monkeypatch.setattr(ts, "_resolve_device_index", lambda device: 0)
+    monkeypatch.setattr(ts.torch.cuda, "device", lambda index: nullcontext())
+    monkeypatch.setattr(ts, "_LOCAL_BUFFERS_BY_HANDLE", {})
+    monkeypatch.setattr(ts, "_IMPORTED_BUFFERS_BY_HANDLE", {})
+    monkeypatch.setattr(ts, "_raw_stream_handle", lambda stream, device: 7)
+    monkeypatch.setattr(ts, "_nogil_driver", lambda: _FakeNoGil())
+    backend = ts.TimelineSemaphoreEventIPCBackend()
+    monkeypatch.setattr(
+        backend, "_get_buffer", lambda index: SimpleNamespace(buffer_ops_stream="s")
+    )
+    return backend, entered, release
+
+
+def _export(handle: bytes, seq: int = 1) -> bytes:
+    return ts._EXPORT_STRUCT.pack(ts._HANDLE_VERSION, handle, 8, seq)
+
+
+def test_force_never_waits_behind_a_semaphore_import(monkeypatch) -> None:
+    """Opening a new worker's semaphore buffer can block in the driver (next
+    to an unmap blocked by a stuck stream on that GPU). Neither the release
+    thread's force nor imports of already-open buffers may queue behind it:
+    only the force can unblock that GPU."""
+    opens: list[bytes] = []
+    backend, entered, release = _blocking_open_backend(monkeypatch, opens)
+    ts._IMPORTED_BUFFERS_BY_HANDLE[(b"O" * 64, 0)] = 0x9000
+    importer = threading.Thread(
+        target=backend.import_event, args=(_export(b"N" * 64), 0), daemon=True
+    )
+    importer.start()
+    assert entered.wait(5)
+
+    forced = threading.Event()
+    cached: list[int] = []
+    threading.Thread(
+        target=lambda: (
+            backend.force_complete_events([_imported(0x1000, 0, 4)]),
+            forced.set(),
+        ),
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=lambda: cached.append(
+            backend.import_event(_export(b"O" * 64), 0).base_ptr
+        ),
+        daemon=True,
+    ).start()
+    try:
+        assert forced.wait(2), "force blocked behind a semaphore import"
+        assert _wait_for(lambda: cached == [0x9000], 2)
+    finally:
+        release.set()
+    importer.join(5)
+    assert opens == [b"N" * 64]
+
+
+def test_concurrent_imports_of_a_new_buffer_open_it_once(monkeypatch) -> None:
+    opens: list[bytes] = []
+    backend, entered, release = _blocking_open_backend(monkeypatch, opens)
+    results: list[int] = []
+
+    def import_new() -> None:
+        results.append(backend.import_event(_export(b"N" * 64), 0).base_ptr)
+
+    threads = [threading.Thread(target=import_new, daemon=True) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    assert entered.wait(5)
+    release.set()
+    for thread in threads:
+        thread.join(5)
+
+    assert opens == [b"N" * 64]
+    assert results == [0x7000, 0x7000]
+
+
 class _FakeNoGil:
     def __init__(self) -> None:
         self.calls: list[tuple] = []
