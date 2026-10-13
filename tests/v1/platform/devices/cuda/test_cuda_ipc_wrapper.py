@@ -296,13 +296,17 @@ def test_cache_context_close_closes_wrappers() -> None:
     assert all(w.closed for w in recorders)
 
 
-def test_cache_context_init_failure_rolls_back_wrappers() -> None:
+def test_cache_context_init_failure_rolls_back_wrappers(monkeypatch) -> None:
     """A registration that fails mid-construction must close the wrappers
     it already imported instead of pinning the worker's pool.
     """
     # First Party
+    from lmcache.v1.platform.base import cache_context as base_cc
     from lmcache.v1.platform.devices.cuda.cache_context import GPUCacheContext
 
+    # Inline close is the no-hook path. A transfer module left alive (until GC)
+    # by an earlier test would otherwise receive the rollback on its unmapper.
+    monkeypatch.setattr(base_cc, "_failed_init_closer", None)
     good = [_CloseRecordingWrapper(t) for t in _make_vllm_style_kv(1)]
     bad = _CloseRecordingWrapper(
         torch.randn(7, device=DEVICE, dtype=torch.float16)  # not a KV shape
