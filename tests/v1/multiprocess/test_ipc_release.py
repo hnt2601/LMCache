@@ -844,6 +844,44 @@ def test_unforceable_backend_is_quarantined(monkeypatch, clock, dev) -> None:
     assert status["stuck_instance_ids"] == [1]
 
 
+def test_failed_force_is_retried_with_backoff(monkeypatch, clock, dev) -> None:
+    """A force that raises (e.g. a transient driver error) is retried with a
+    growing delay instead of leaving the release stuck for good."""
+    module = _module(monkeypatch, grace=30.0, stuck=60.0)
+    stream = _Stream(drained=False)
+    backend = _ForcingBackend(stream)
+    real_force = backend.force_complete_events
+    failures = {"left": 2}
+
+    def flaky_force(events: list[object]) -> int:
+        if failures["left"]:
+            failures["left"] -= 1
+            raise RuntimeError("transient")
+        return real_force(events)
+
+    backend.force_complete_events = flaky_force
+    ctx = _register(module, monkeypatch, clock, 1, stream, backend)
+    module.unregister_kv_cache(1)
+
+    clock.now += 31.0
+    module._release_cycle()  # first attempt fails; retry in 2s
+    clock.now += 1.0
+    module._release_cycle()  # backing off: no attempt
+    assert failures["left"] == 1
+    clock.now += 1.0
+    module._release_cycle()  # second attempt fails; retry in 4s
+    assert failures["left"] == 0
+    clock.now += 4.0
+    module._release_cycle()  # third attempt forces; the stream drains
+    module._release_cycle()
+
+    ctx.close.assert_called_once()
+    status = module.release_status()
+    assert status["force_errors"] == 2
+    assert status["forced"] == 1
+    assert status["pending_instance_ids"] == []
+
+
 def test_stuck_release_exits_when_configured(monkeypatch, clock, dev) -> None:
     module = _module(monkeypatch, grace=1.0, stuck=1.0, action="exit")
     stream = _Stream(drained=False)

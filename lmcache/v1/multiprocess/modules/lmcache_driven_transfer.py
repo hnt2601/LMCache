@@ -187,6 +187,10 @@ STUCK_RELEASE_EXIT_CODE = 75
 #: are dropped rather than committed.
 _POISON_RETENTION_SECONDS = 300.0
 
+#: Longest delay between retries of a force that raised. Retries back off
+#: from the poll interval, doubling per failure.
+_FORCE_RETRY_MAX_SECONDS = 60.0
+
 
 #: Free device memory kept on top of a guarded allocation (see
 #: _check_device_alloc), for other processes allocating concurrently.
@@ -278,6 +282,9 @@ class _PendingRelease:
     force_blocked: str | None = None
     #: Set once "nothing_held" has been reported, to log and count it once.
     reported_nothing_held: bool = False
+    #: Forces that raised so far, and when the next one may be tried.
+    force_failures: int = 0
+    force_retry_at: float | None = None
     #: Drained, but held back by a stuck stream on the same device.
     held_back: bool = False
 
@@ -404,6 +411,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             "forced": 0,
             "force_blocked": 0,
             "release_errors": 0,
+            "force_errors": 0,
             "dropped_commits": 0,
             "alloc_refused": 0,
         }
@@ -1079,7 +1087,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 continue
             if now - item.started < cfg.drain_grace_seconds:
                 continue
-            if item.force_blocked is None:
+            if item.force_blocked is None and (
+                item.force_retry_at is None or now >= item.force_retry_at
+            ):
                 self._force_release(item, now)
             if item.stuck_since is None:
                 item.stuck_since = (
@@ -1181,10 +1191,23 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         try:
             slots = force(events)
         except Exception:
-            logger.exception(
-                "Force-completing events of instance %d failed", item.instance_id
+            # Retried with backoff: a one-shot failure must not leave the
+            # release stuck (and its GPU gated) for the server's lifetime.
+            item.force_failures += 1
+            delay = min(
+                self._release_config.poll_interval_seconds * 2**item.force_failures,
+                _FORCE_RETRY_MAX_SECONDS,
             )
-            item.force_blocked = "force_failed"
+            item.force_retry_at = now + delay
+            with self._release_lock:
+                self._release_counters["force_errors"] += 1
+            logger.exception(
+                "Force-completing events of instance %d failed (attempt %d); "
+                "retrying in %.0fs",
+                item.instance_id,
+                item.force_failures,
+                delay,
+            )
             return
         if item.forced_at is None:
             item.forced_at = now
