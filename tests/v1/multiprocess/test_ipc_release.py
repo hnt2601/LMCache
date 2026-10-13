@@ -31,7 +31,12 @@ from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
     IPCReleaseConfig,
     LMCacheDrivenTransferModule,
 )
+from lmcache.utils import EngineType
 from lmcache.v1.platform.devices.cuda import timeline_semaphore_event_ipc as ts
+from lmcache.v1.platform.devices.cuda.ipc_wrapper import (
+    CudaIPCWrapper,
+    RawCudaIPCWrapper,
+)
 import lmcache.v1.multiprocess.modules.lmcache_driven_transfer as gpu_mod
 
 
@@ -608,6 +613,53 @@ def test_failed_registration_after_construction_unmaps_context(
 # ---------------------------------------------------------- allocation guard --
 
 _MIB = 1 << 20
+
+
+@pytest.mark.parametrize(
+    "server_isolated, wrapper_cls, engine_type, refused",
+    [
+        (True, CudaIPCWrapper, EngineType.VLLM, True),
+        (False, RawCudaIPCWrapper, EngineType.VLLM, True),
+        (True, RawCudaIPCWrapper, EngineType.VLLM, False),
+        (False, CudaIPCWrapper, EngineType.VLLM, False),
+        # TRT-LLM always shares its cudaMalloc'd pool through raw handles.
+        (False, RawCudaIPCWrapper, EngineType.TRTLLM, False),
+    ],
+)
+def test_register_refuses_an_isolated_ipc_mismatch(
+    monkeypatch, clock, server_isolated, wrapper_cls, engine_type, refused
+) -> None:
+    """A worker whose isolated-IPC setting differs from the server's would
+    register fine and then fail every STORE/RETRIEVE in import_event, with no
+    reply (its futures hang). Refuse it at REGISTER, before anything is
+    mapped, so the worker fails fast with the reason."""
+    module = _module(monkeypatch)
+    monkeypatch.setattr(gpu_mod, "is_isolated_ipc", lambda: server_isolated)
+    created: list[object] = []
+
+    def create(*args, **kwargs):
+        created.append(args)
+        raise RuntimeError("context construction reached")
+
+    monkeypatch.setattr(gpu_mod, "create_cache_context", create)
+    wrapper = object.__new__(wrapper_cls)
+
+    with pytest.raises(RuntimeError) as raised:
+        module.register_kv_cache(
+            1,
+            kv_caches=[wrapper],
+            model_name="m",
+            world_size=1,
+            engine_type=engine_type,
+            layout_hints=MagicMock(),
+            engine_group_infos=[],
+        )
+
+    if refused:
+        assert "isolated" in str(raised.value)
+        assert created == []
+    else:
+        assert "context construction reached" in str(raised.value)
 
 
 def test_allocator_segment_bytes_mirrors_caching_allocator() -> None:

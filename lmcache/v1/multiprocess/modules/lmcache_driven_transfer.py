@@ -60,6 +60,7 @@ from lmcache.v1.platform.base.event_ipc import (
     get_event_ipc_backend,
 )
 from lmcache.v1.platform.cache_context import create_cache_context
+from lmcache.v1.platform.ipc_policy import is_isolated_ipc
 import lmcache.lmcache_native as lmcache_native
 
 logger = init_logger(__name__)
@@ -289,6 +290,46 @@ class _PendingRelease:
     force_retry_at: float | None = None
     #: Drained, but held back by a stuck stream on the same device.
     held_back: bool = False
+
+
+def _isolated_ipc_mismatch(kv_caches: Any, engine_type: EngineType) -> str | None:
+    """Return why a worker's KV wrappers do not match this server's IPC mode.
+
+    The event backend follows the isolated-IPC switch on each side, so a
+    mismatched worker registers fine and then fails every STORE/RETRIEVE in
+    import_event. Its KV wrapper type gives its setting away: the vLLM-style
+    adapters wrap with :class:`RawCudaIPCWrapper` exactly when isolated IPC is
+    on. TRT-LLM always does (its pool is raw ``cudaMalloc``), and the VMM
+    wrapper goes either way, so those are not judged.
+
+    Args:
+        kv_caches: The registration's KV cache wrappers.
+        engine_type: The engine that produced them.
+
+    Returns:
+        The reason, or None when they match (or cannot be judged).
+    """
+    # First Party
+    from lmcache.v1.platform.devices.cuda.ipc_wrapper import (
+        CudaIPCWrapper,
+        RawCudaIPCWrapper,
+    )
+
+    if is_isolated_ipc():
+        if any(isinstance(w, CudaIPCWrapper) for w in kv_caches):
+            return (
+                "this server runs with --isolated-ipc but the worker shares its "
+                "KV cache through legacy CUDA IPC; set lmcache.mp.isolated_ipc "
+                "on the worker"
+            )
+    elif engine_type != EngineType.TRTLLM and any(
+        isinstance(w, RawCudaIPCWrapper) for w in kv_caches
+    ):
+        return (
+            "the worker uses isolated IPC (lmcache.mp.isolated_ipc) but this "
+            "server runs without --isolated-ipc"
+        )
+    return None
 
 
 def _min_l1_write_ttl_seconds(storage_manager: Any) -> float | None:
@@ -1430,6 +1471,14 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     instance_id,
                 )
                 return
+
+        mismatch = _isolated_ipc_mismatch(kv_caches, engine_type)
+        if mismatch is not None:
+            # Before anything is mapped; the worker gets this as a handler
+            # error and fails fast instead of hanging on every transfer.
+            raise RuntimeError(
+                f"Refusing to register instance {instance_id}: {mismatch}"
+            )
 
         # Build the context and layout descriptor outside the lock.
         cache_context = create_cache_context(
