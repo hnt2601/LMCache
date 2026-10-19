@@ -43,8 +43,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import ctypes
 import enum
+import itertools
 import struct
 import threading
+import weakref
 
 # Third Party
 import torch
@@ -244,16 +246,83 @@ class _TimelineSemaphoreBuffer:
 # import_event resolves same-process handles locally, since
 # cudaIpcOpenMemHandle cannot open a handle in the exporting process.
 _LOCAL_BUFFERS_BY_HANDLE: dict[bytes, int] = {}
-# Imported buffers by (handle bytes, importer device index); mappings live
-# for the process lifetime (32 KiB each).
+# Imported buffers by (handle bytes, importer device index). A mapping lives
+# until release_imported_buffers() drops its last user, or for the process
+# lifetime when it was imported without one. Each costs a 2 MiB driver
+# mapping (32 KiB used), and an exporter that died keeps its whole buffer
+# alive through it, so mappings of dead workers must be closed.
 _IMPORTED_BUFFERS_BY_HANDLE: dict[tuple[bytes, int], int] = {}
-# Imports whose cudaIpcOpenMemHandle is in progress, each with an event set
-# when it returns. The open runs OUTSIDE _HANDLE_REGISTRY_LOCK: next to an
-# unmap blocked by a stuck stream on the same GPU it blocks too, and under
-# the lock it would block every import on every GPU and the force that is
-# the only way to unblock that GPU (force_complete_events takes the lock).
+# Users of each imported buffer, by user token (see _user_token). Recorded
+# under _HANDLE_REGISTRY_LOCK in the same critical section that resolves the
+# buffer, so a buffer can never be closed between an import resolving it and
+# that import's user being counted.
+_IMPORTED_BUFFER_USERS: dict[tuple[bytes, int], set[int]] = {}
+# Token of an import made without a user: pins its buffer for good.
+_PINNED_USER = 0
+_USER_TOKEN_ATTR = "_lmcache_semaphore_user_token"
+_USER_TOKENS = itertools.count(1)
+_USER_TOKENS_BY_OBJECT: "weakref.WeakKeyDictionary[object, int]" = (
+    weakref.WeakKeyDictionary()
+)
+_USER_TOKENS_LOCK = threading.Lock()
+# Buffers whose cudaIpcOpenMemHandle (or cudaIpcCloseMemHandle) is in
+# progress, each with an event set when it returns. Both run OUTSIDE
+# _HANDLE_REGISTRY_LOCK: next to an unmap blocked by a stuck stream on the
+# same GPU they block too, and under the lock they would block every import
+# on every GPU and the force that is the only way to unblock that GPU
+# (force_complete_events takes the lock). An import finding the key here
+# waits and looks again, so it reopens a buffer closed under it.
 _IMPORTING_BUFFERS: dict[tuple[bytes, int], threading.Event] = {}
 _HANDLE_REGISTRY_LOCK = threading.Lock()
+
+
+def _user_token(user: object | None, mint: bool = True) -> int | None:
+    """Return the import-user token of ``user``, minting one on first use.
+
+    The token is stored on the user itself, or in a weak-keyed registry for
+    objects that take no attributes. Not ``id(user)``: an id can be reused
+    by a later object once ``user`` is gone, and a stale count must never
+    close a live user's buffer. An object that can neither carry an
+    attribute nor be weakly referenced cannot be tracked and pins its
+    buffers, as an import without a user does.
+
+    Args:
+        user: The owner of an import (a registration's cache context), or
+            None for an import nothing will ever release.
+        mint: Whether to create a token for a user that has none.
+
+    Returns:
+        A process-unique positive token; ``_PINNED_USER`` for None or an
+        untrackable user; None when ``mint`` is False and the user has none.
+    """
+    if user is None:
+        return _PINNED_USER
+    token = getattr(user, _USER_TOKEN_ATTR, None)
+    if token is not None:
+        return token
+    with _USER_TOKENS_LOCK:
+        try:
+            token = _USER_TOKENS_BY_OBJECT.get(user)
+        except TypeError:  # not weakly referenceable
+            token = None
+        if token is not None or not mint:
+            return token
+        token = next(_USER_TOKENS)
+        try:
+            setattr(user, _USER_TOKEN_ATTR, token)
+            return token
+        except (AttributeError, TypeError):
+            pass
+        try:
+            _USER_TOKENS_BY_OBJECT[user] = token
+            return token
+        except TypeError:
+            logger.warning(
+                "Semaphore-buffer import user %r can carry no token; its buffers "
+                "stay mapped for the process lifetime",
+                type(user).__name__,
+            )
+            return _PINNED_USER
 
 
 def _enqueue_wait(event: TimelineSemaphoreEvent, stream: object | None) -> None:
@@ -453,16 +522,25 @@ class TimelineSemaphoreEventIPCBackend:
             _HANDLE_VERSION, handle_bytes, slot_offset, event.seq
         )
 
-    def import_event(self, handle: bytes, device: object) -> object:
+    #: import_event accepts ``user`` and release_imported_buffers exists.
+    supports_import_users = True
+
+    def import_event(
+        self, handle: bytes, device: object, user: object | None = None
+    ) -> object:
         """Import a serialized timeline-semaphore event handle on ``device``.
 
         Opens the exporter's semaphore buffer on first use and caches the
-        mapping for the process lifetime; same-process handles resolve to
-        the local buffer.
+        mapping; same-process handles resolve to the local buffer. The
+        mapping is closed by :meth:`release_imported_buffers` once every
+        user that imported through it has been released; an import without
+        a user keeps it for the process lifetime.
 
         Args:
             handle: Bytes produced by :meth:`export_event`.
             device: Device on which to import the event.
+            user: The owner of this import, typically the registration's
+                cache context, or None.
 
         Returns:
             An imported :class:`TimelineSemaphoreEvent` (wait/query only).
@@ -502,11 +580,14 @@ class TimelineSemaphoreEventIPCBackend:
         # Two threads importing the same new handle open it once: the second
         # waits for the first's open (opening is rare; imports hit the cache).
         key = (handle_bytes, device_index)
+        user_token = _user_token(user)
         while True:
             with _HANDLE_REGISTRY_LOCK:
                 base_ptr: int | None = _LOCAL_BUFFERS_BY_HANDLE.get(handle_bytes)
                 if base_ptr is None:
                     base_ptr = _IMPORTED_BUFFERS_BY_HANDLE.get(key)
+                    if base_ptr is not None:
+                        _IMPORTED_BUFFER_USERS.setdefault(key, set()).add(user_token)
                 opening = _IMPORTING_BUFFERS.get(key)
                 if base_ptr is None and opening is None:
                     done = threading.Event()
@@ -529,6 +610,7 @@ class TimelineSemaphoreEventIPCBackend:
                     base_ptr = int(opened_ptr)
                 with _HANDLE_REGISTRY_LOCK:
                     _IMPORTED_BUFFERS_BY_HANDLE[key] = base_ptr
+                    _IMPORTED_BUFFER_USERS.setdefault(key, set()).add(user_token)
             finally:
                 with _HANDLE_REGISTRY_LOCK:
                     del _IMPORTING_BUFFERS[key]
@@ -543,6 +625,75 @@ class TimelineSemaphoreEventIPCBackend:
             seq=seq,
             handle_bytes=handle_bytes,
         )
+
+    def release_imported_buffers(self, user: object) -> int:
+        """Drop ``user`` from every buffer it imported; close unused buffers.
+
+        Call only once nothing ``user`` queued can still wait on its imports:
+        its stream has drained (or its waits were force-completed) and its
+        own mappings are closed. A buffer is closed when no other user is
+        left, so a worker that registered again (same process, same buffer)
+        keeps it open. Buffers imported without a user are never closed.
+
+        A failed close leaves that mapping open (the pre-existing behaviour)
+        and is logged; it never raises.
+
+        Args:
+            user: The owner passed to :meth:`import_event`.
+
+        Returns:
+            The number of buffer mappings closed.
+        """
+        token = _user_token(user, mint=False)
+        if not token:
+            return 0
+        to_close: list[tuple[tuple[bytes, int], int, threading.Event]] = []
+        with _HANDLE_REGISTRY_LOCK:
+            for key, users in list(_IMPORTED_BUFFER_USERS.items()):
+                if token not in users:
+                    continue
+                users.discard(token)
+                if users or key in _IMPORTING_BUFFERS:
+                    continue
+                del _IMPORTED_BUFFER_USERS[key]
+                base_ptr = _IMPORTED_BUFFERS_BY_HANDLE.pop(key, None)
+                if base_ptr is None:
+                    continue
+                # Imports of this key wait for the close, then reopen.
+                done = threading.Event()
+                _IMPORTING_BUFFERS[key] = done
+                to_close.append((key, base_ptr, done))
+        closed = 0
+        for key, base_ptr, done in to_close:
+            try:
+                with torch.cuda.device(key[1]):
+                    _CHECK_CUDA(
+                        _cuda.runtime.cudaIpcCloseMemHandle(base_ptr),
+                        "cudaIpcCloseMemHandle (semaphore buffer)",
+                    )
+                closed += 1
+            except Exception:
+                # Still mapped: put it back, pinned, so later imports reuse
+                # it instead of trying to open the same handle again.
+                with _HANDLE_REGISTRY_LOCK:
+                    _IMPORTED_BUFFERS_BY_HANDLE[key] = base_ptr
+                    _IMPORTED_BUFFER_USERS.setdefault(key, set()).add(_PINNED_USER)
+                logger.exception(
+                    "Closing an imported semaphore buffer on device %d failed; "
+                    "its mapping stays open",
+                    key[1],
+                )
+            finally:
+                with _HANDLE_REGISTRY_LOCK:
+                    del _IMPORTING_BUFFERS[key]
+                done.set()
+        return closed
+
+    @staticmethod
+    def imported_buffer_count() -> int:
+        """Return how many imported semaphore buffers are mapped right now."""
+        with _HANDLE_REGISTRY_LOCK:
+            return len(_IMPORTED_BUFFERS_BY_HANDLE)
 
     def wait_event(self, event: object, stream: object) -> None:
         """Make ``stream`` wait for ``event``.

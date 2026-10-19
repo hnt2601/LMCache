@@ -498,6 +498,34 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             return
         self._ctx.storage_manager.finish_write_by_owner(completion)
 
+    @staticmethod
+    def _import_producer_event(
+        event_backend: EventIPCBackend,
+        event_ipc_handle: bytes,
+        cache_context: BaseCacheContext,
+    ) -> object:
+        """Import a worker's event on behalf of ``cache_context``.
+
+        A backend that tracks import users (the timeline-semaphore one) is
+        told which registration imported the exporter's semaphore buffer, so
+        the buffer mapping can be closed with that registration instead of
+        staying mapped for the process lifetime. Other backends take the
+        protocol's two arguments.
+
+        Args:
+            event_backend: The context device's event backend.
+            event_ipc_handle: Bytes the worker exported.
+            cache_context: The registration the transfer runs under.
+
+        Returns:
+            The imported event.
+        """
+        if getattr(event_backend, "supports_import_users", False):
+            return event_backend.import_event(  # type: ignore[call-arg]
+                event_ipc_handle, cache_context.device, user=cache_context
+            )
+        return event_backend.import_event(event_ipc_handle, cache_context.device)
+
     def _release_imported_event(self, payload: tuple[int, int]) -> None:
         """Drop an imported worker event; the stream wait queued on it has run.
 
@@ -955,6 +983,23 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 # Keep going: one failed close must not strand the others.
                 errors += 1
                 logger.exception("Closing a released cache context failed")
+                continue
+            # The worker's semaphore buffer, imported by this registration's
+            # transfers, goes with its KV mappings: after close() nothing of
+            # this registration can still wait on it, and the force path
+            # only touches slots of releases still pending. Left mapped, every
+            # dead worker would pin its buffer's 2 MiB mapping for good.
+            release_buffers = getattr(
+                entry.event_backend, "release_imported_buffers", None
+            )
+            if release_buffers is not None:
+                try:
+                    release_buffers(entry.cache_context)
+                except Exception:
+                    errors += 1
+                    logger.exception(
+                        "Closing a released registration's semaphore buffers failed"
+                    )
         if entries:
             del entry
         count = len(entries)
@@ -1754,8 +1799,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
             # Held before anything is queued on the stream, released by the
             # section's last op (see _end_held_section).
-            producer_event = event_backend.import_event(
-                event_ipc_handle, cache_context.device
+            producer_event = self._import_producer_event(
+                event_backend, event_ipc_handle, cache_context
             )
             import_token = cache_context.hold_imported_event(producer_event)
             held_section.callback(
@@ -2042,8 +2087,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             # Cut and stage all block_ids to GPU once before the transfer
             # Held before anything is queued on the stream, released by the
             # section's last op (see _end_held_section).
-            producer_event = event_backend.import_event(
-                event_ipc_handle, cache_context.device
+            producer_event = self._import_producer_event(
+                event_backend, event_ipc_handle, cache_context
             )
             import_token = cache_context.hold_imported_event(producer_event)
             held_section.callback(

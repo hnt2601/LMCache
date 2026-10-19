@@ -510,3 +510,70 @@ def test_cross_process_synchronize_blocks_until_record_point(
             child.kill()
             child.join()
     assert child.exitcode == 0
+
+
+class _ImportUser:
+    """Stands in for a registration's cache context (an object taking attributes)."""
+
+
+def _buffer_release_producer(conn: Connection) -> None:
+    """Child: export two recorded events from the same buffer and stay alive
+    until released, so the importer's open/close/reopen runs against a live
+    exporter."""
+    torch.cuda.init()
+    torch.cuda.set_device(0)
+    backend = TimelineSemaphoreEventIPCBackend()
+    device = torch.device(DEVICE)
+    stream = torch.cuda.current_stream()
+    handles = []
+    for _ in range(2):
+        event = backend.create_event(device)
+        backend.record_event(event, stream)
+        stream.synchronize()
+        handles.append(backend.export_event(event, device))
+    conn.send(handles)
+    conn.recv()
+
+
+def test_imported_buffer_is_closed_with_its_last_user() -> None:
+    """The server side of a dead worker's release: the exporter's semaphore
+    buffer is opened once for two registrations (users), survives the first
+    release, is closed by the second, and can be opened again afterwards --
+    against a real cudaIpcOpenMemHandle/cudaIpcCloseMemHandle."""
+    ctx = get_context("spawn")
+    conn, child_end = ctx.Pipe()
+    producer = ctx.Process(target=_buffer_release_producer, args=(child_end,))
+    producer.start()
+    try:
+        handle_a, handle_b = conn.recv()
+        backend = TimelineSemaphoreEventIPCBackend()
+        device = torch.device(DEVICE)
+        user_a, user_b = _ImportUser(), _ImportUser()
+        before = backend.imported_buffer_count()
+
+        event_a = backend.import_event(handle_a, device, user=user_a)
+        event_b = backend.import_event(handle_b, device, user=user_b)
+        assert event_a.base_ptr == event_b.base_ptr
+        assert backend.imported_buffer_count() == before + 1
+        assert backend.query_event(event_a) is True
+        assert backend.query_event(event_b) is True
+
+        assert backend.release_imported_buffers(user_a) == 0
+        assert backend.imported_buffer_count() == before + 1
+        assert backend.query_event(event_b) is True
+
+        assert backend.release_imported_buffers(user_b) == 1
+        assert backend.imported_buffer_count() == before
+
+        reopened = backend.import_event(handle_a, device, user=user_a)
+        assert backend.imported_buffer_count() == before + 1
+        assert backend.query_event(reopened) is True
+        assert backend.release_imported_buffers(user_a) == 1
+        assert backend.imported_buffer_count() == before
+    finally:
+        conn.send("release")
+        producer.join(timeout=60)
+        if producer.is_alive():
+            producer.kill()
+            producer.join()
+    assert producer.exitcode == 0

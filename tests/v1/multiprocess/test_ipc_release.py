@@ -1362,3 +1362,82 @@ def test_concurrent_release_cycles_are_serialized(monkeypatch, clock, dev) -> No
     worker.join(5)
     assert summary.message == "cycle busy"
     assert seen == ["enter", "exit"]
+
+
+# ------------------------------------------------- semaphore buffer release --
+
+
+class _BufferReleasingBackend(_ForcingBackend):
+    """Forcing backend that also tracks import users, like the real one."""
+
+    supports_import_users = True
+
+    def __init__(self, stream: _Stream) -> None:
+        super().__init__(stream)
+        self.released: list[object] = []
+
+    def release_imported_buffers(self, user: object) -> int:
+        self.released.append(user)
+        return 1
+
+
+def test_released_registration_closes_its_semaphore_buffers(
+    monkeypatch, clock, dev
+) -> None:
+    module = _module(monkeypatch)
+    stream = _Stream(drained=True)
+    backend = _BufferReleasingBackend(stream)
+    ctx = _register(module, monkeypatch, clock, 1, stream, backend)
+
+    module.unregister_kv_cache(1)
+
+    ctx.close.assert_called_once()
+    # After the KV mappings, with the registration that imported through them.
+    assert backend.released == [ctx]
+
+
+def test_forced_release_closes_its_semaphore_buffers(monkeypatch, clock, dev) -> None:
+    module = _module(monkeypatch, grace=30.0)
+    stream = _Stream(drained=False)
+    backend = _BufferReleasingBackend(stream)
+    ctx = _register(module, monkeypatch, clock, 1, stream, backend)
+
+    module.unregister_kv_cache(1)
+    assert backend.released == []
+    clock.sleep(31.0)
+    module._release_cycle()  # past the grace: forces, which drains the stream
+    assert backend.forced
+    assert backend.released == []
+    module._release_cycle()  # drained now: unmapped
+
+    ctx.close.assert_called_once()
+    assert backend.released == [ctx]
+
+
+def test_failed_context_close_keeps_its_semaphore_buffers(
+    monkeypatch, clock, dev
+) -> None:
+    module = _module(monkeypatch)
+    stream = _Stream(drained=True)
+    backend = _BufferReleasingBackend(stream)
+    ctx = _register(module, monkeypatch, clock, 1, stream, backend)
+    ctx.close.side_effect = RuntimeError("boom")
+
+    module.unregister_kv_cache(1)
+
+    # The KV mappings may still be live: the buffer stays mapped with them.
+    assert backend.released == []
+    assert module.release_status()["release_errors"] == 1
+
+
+def test_legacy_backend_without_buffer_release_is_unaffected(
+    monkeypatch, clock, dev
+) -> None:
+    module = _module(monkeypatch)
+    stream = _Stream(drained=True)
+    ctx = _register(module, monkeypatch, clock, 1, stream, _LegacyBackend())
+
+    module.unregister_kv_cache(1)
+
+    ctx.close.assert_called_once()
+    assert module.release_status()["release_errors"] == 0
