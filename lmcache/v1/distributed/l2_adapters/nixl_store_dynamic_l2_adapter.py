@@ -18,6 +18,17 @@ Secondary lookup (always on):
 - Lookup always checks secondary storage (disk) on miss and lazily
   populates the in-memory index when a file is found. File names are
   derived deterministically from ObjectKey.
+
+Index/disk consistency (FCI patch 0026):
+- ``delete()`` runs on the eviction thread and unlinks files outside the
+  lock. Keys being deleted are tombstoned in ``_deleting`` until the unlink
+  finishes, so a concurrent lookup cannot re-add them from disk and a
+  concurrent store cannot publish a file that the delete then removes.
+- Eviction works on whole chunks: all objects sharing
+  ``(model_name, chunk_hash, cache_salt)`` (every kv_rank and object group)
+  are deleted together, or kept together when any of them is pinned.
+- A load that finds its file missing (ENOENT/ESTALE) drops the whole chunk
+  from the index instead of leaving a stale entry that fails on every load.
 """
 
 # Future
@@ -26,7 +37,11 @@ from __future__ import annotations
 # Standard
 from typing import Optional
 import asyncio
+import errno
 import threading
+
+# Third Party
+from opentelemetry import metrics
 
 # First Party
 from lmcache.lmcache_native import Bitmap
@@ -55,6 +70,51 @@ from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.platform import create_event_notifier
 
 logger = init_logger(__name__)
+
+ChunkId = tuple[str, bytes, str]
+
+
+def _chunk_id(key: ObjectKey) -> ChunkId:
+    """Identify the chunk an object belongs to (all kv_ranks and groups)."""
+    return (key.model_name, key.chunk_hash, key.cache_salt)
+
+
+def _missing_file_reason(exc: BaseException) -> Optional[str]:
+    """Return ``enoent``/``estale`` when ``exc`` means the file is gone."""
+    if isinstance(exc, FileNotFoundError):
+        return "enoent"
+    if isinstance(exc, OSError) and exc.errno == errno.ESTALE:
+        return "estale"
+    return None
+
+
+_meter = metrics.get_meter("lmcache_mp.health")
+_LOAD_MISSING_COUNTER = _meter.create_counter(
+    "lmcache_mp.l2_load_missing_object",
+    description=(
+        "L2 objects that were in the index but whose file was missing at load "
+        "time. Tagged by reason = enoent | estale."
+    ),
+    unit="objects",
+)
+_DROPPED_CHUNK_COUNTER = _meter.create_counter(
+    "lmcache_mp.l2_dropped_missing_chunk",
+    description="Chunks dropped from the L2 index after a missing-file load.",
+    unit="chunks",
+)
+_TOMBSTONE_SKIP_COUNTER = _meter.create_counter(
+    "lmcache_mp.l2_tombstone_skip",
+    description=(
+        "Lookups or stores that skipped a key because it was being deleted. "
+        "Tagged by op = lookup | store."
+    ),
+    unit="objects",
+)
+_PINNED_CHUNK_SKIP_COUNTER = _meter.create_counter(
+    "lmcache_mp.l2_eviction_pinned_chunk_skip",
+    description="Eviction candidates kept because a sibling object was pinned.",
+    unit="chunks",
+)
 
 
 def _create_dynamic_nixl_storage_agent(
@@ -130,6 +190,16 @@ class DynamicNixlStoreL2Adapter(L2AdapterInterface):
         self._memory_objects: dict[ObjectKey, NixlStoreObj] = {}
         self._inflight_stores: set[ObjectKey] = set()
         self._total_bytes: int = 0
+        # Patch 0026: keys whose index entry is gone but whose file may still
+        # be on disk (delete in progress), and the per-chunk member index.
+        self._deleting: set[ObjectKey] = set()
+        self._chunk_members: dict[ChunkId, set[ObjectKey]] = {}
+        self._consistency_stats: dict[str, int] = {
+            "load_missing_objects": 0,
+            "dropped_missing_chunks": 0,
+            "tombstone_skips": 0,
+            "pinned_chunk_skips": 0,
+        }
 
         # Task ID management
         self._next_task_id: L2TaskId = 0
@@ -232,33 +302,137 @@ class DynamicNixlStoreL2Adapter(L2AdapterInterface):
     #####################
 
     def delete(self, keys: list[ObjectKey]) -> None:
-        """Delete objects from storage, removing their files from disk."""
+        """Delete objects from storage, removing their files from disk.
+
+        Each requested key expands to every object of its chunk. A chunk is
+        skipped as a whole when any of its objects is pinned. Deleted keys
+        stay tombstoned until their files are unlinked.
+        """
         to_delete: list[tuple[ObjectKey, int]] = []
+        pinned_chunks = 0
         with self._lock:
+            seen: set[ChunkId] = set()
             for key in keys:
-                obj = self._memory_objects.get(key)
-                if obj is None:
+                if key not in self._memory_objects:
                     continue
-                if obj.pin_count > 0:
+                cid = _chunk_id(key)
+                if cid in seen:
+                    continue
+                seen.add(cid)
+                members = list(self._chunk_members.get(cid, ()))
+                pinned = [k for k in members if self._memory_objects[k].pin_count > 0]
+                if pinned:
                     logger.debug(
-                        "Skipping eviction of pinned key %s (pin_count=%d)",
+                        "Skipping eviction of chunk of %s: %d pinned object(s)",
                         key,
-                        obj.pin_count,
+                        len(pinned),
                     )
+                    pinned_chunks += 1
                     continue
-                self._total_bytes -= obj.size
-                del self._memory_objects[key]
-                to_delete.append((key, obj.size))
-        # Filesystem I/O outside the lock to avoid blocking concurrent
-        # store/lookup/load operations.
-        deleted_keys: list[ObjectKey] = []
-        deleted_sizes: list[int] = []
-        for key, size in to_delete:
-            self.nixl_agent.dynamic_delete(key)
-            deleted_keys.append(key)
-            deleted_sizes.append(size)
-        if deleted_keys:
-            self._notify_keys_deleted(deleted_keys, deleted_sizes)
+                for member in members:
+                    obj = self._index_remove_locked(member)
+                    assert obj is not None
+                    self._total_bytes -= obj.size
+                    self._deleting.add(member)
+                    to_delete.append((member, obj.size))
+            self._consistency_stats["pinned_chunk_skips"] += pinned_chunks
+        if pinned_chunks:
+            _PINNED_CHUNK_SKIP_COUNTER.add(pinned_chunks)
+        self._unlink_tombstoned(to_delete)
+
+    def _index_add_locked(self, key: ObjectKey, obj: NixlStoreObj) -> None:
+        """Insert ``key`` into the index. Caller holds ``self._lock``."""
+        self._memory_objects[key] = obj
+        self._chunk_members.setdefault(_chunk_id(key), set()).add(key)
+
+    def _index_remove_locked(self, key: ObjectKey) -> Optional[NixlStoreObj]:
+        """Remove ``key`` from the index. Caller holds ``self._lock``.
+
+        Byte accounting is left to the caller.
+        """
+        obj = self._memory_objects.pop(key, None)
+        if obj is None:
+            return None
+        cid = _chunk_id(key)
+        members = self._chunk_members.get(cid)
+        if members is not None:
+            members.discard(key)
+            if not members:
+                del self._chunk_members[cid]
+        return obj
+
+    def _unlink_tombstoned(
+        self,
+        entries: list[tuple[ObjectKey, int]],
+        skip_unlink: Optional[set[ObjectKey]] = None,
+    ) -> None:
+        """Unlink files of tombstoned keys, clear the tombstones, notify.
+
+        Filesystem I/O runs outside the lock so concurrent store, lookup and
+        load are not blocked; the tombstones keep them away from these keys.
+        """
+        if not entries:
+            return
+        try:
+            for key, _ in entries:
+                if skip_unlink is None or key not in skip_unlink:
+                    self.nixl_agent.dynamic_delete(key)
+        finally:
+            with self._lock:
+                for key, _ in entries:
+                    self._deleting.discard(key)
+        self._notify_keys_deleted([k for k, _ in entries], [s for _, s in entries])
+
+    def _drop_missing_chunks(self, missing: list[tuple[ObjectKey, str]]) -> None:
+        """Drop every chunk that has an object whose file is missing.
+
+        The missing objects themselves are not unlinked again; their present
+        siblings are, because a partial chunk cannot serve a hit.
+        """
+        to_drop: list[tuple[ObjectKey, int]] = []
+        dropped_chunks: list[ObjectKey] = []
+        with self._lock:
+            seen: set[ChunkId] = set()
+            for key, reason in missing:
+                self._consistency_stats["load_missing_objects"] += 1
+                _LOAD_MISSING_COUNTER.add(1, {"reason": reason})
+                cid = _chunk_id(key)
+                if cid in seen:
+                    continue
+                seen.add(cid)
+                members = set(self._chunk_members.get(cid, ()))
+                if not members:
+                    continue  # already dropped by another load or delete
+                for member in members:
+                    obj = self._index_remove_locked(member)
+                    assert obj is not None
+                    self._total_bytes -= obj.size
+                    self._deleting.add(member)
+                    to_drop.append((member, obj.size))
+                dropped_chunks.append(key)
+            self._consistency_stats["dropped_missing_chunks"] += len(dropped_chunks)
+        for key in dropped_chunks:
+            logger.warning("L2 object missing on load, dropped its chunk: %s", key)
+        if dropped_chunks:
+            _DROPPED_CHUNK_COUNTER.add(len(dropped_chunks))
+        self._unlink_tombstoned(to_drop, skip_unlink={k for k, _ in missing})
+
+    def _count_tombstone_skip(self, op: str) -> None:
+        """Record a lookup/store skipped by a tombstone. Caller holds the lock."""
+        self._consistency_stats["tombstone_skips"] += 1
+        _TOMBSTONE_SKIP_COUNTER.add(1, {"op": op})
+
+    def _partial_chunk_count_locked(self) -> int:
+        """Chunks with fewer objects than the largest chunk of the same model."""
+        largest: dict[tuple[str, str], int] = {}
+        for (model, _hash, salt), members in self._chunk_members.items():
+            group = (model, salt)
+            largest[group] = max(largest.get(group, 0), len(members))
+        return sum(
+            1
+            for (model, _hash, salt), members in self._chunk_members.items()
+            if len(members) < largest[(model, salt)]
+        )
 
     # ``get_usage`` is inherited from L2AdapterInterface; byte accounting
     # is driven by ``_notify_keys_*`` through the base class now.
@@ -273,6 +447,13 @@ class DynamicNixlStoreL2Adapter(L2AdapterInterface):
             pinned_object_count = sum(
                 1 for obj in self._memory_objects.values() if obj.pin_count > 0
             )
+            consistency = dict(self._consistency_stats)
+            consistency["deleting_objects"] = len(self._deleting)
+            consistency["stored_chunk_count"] = len(self._chunk_members)
+            consistency["partial_chunks"] = self._partial_chunk_count_locked()
+        consistency["store_dir_recreated"] = getattr(
+            self.nixl_agent, "dir_recreated_count", 0
+        )
         return {
             "is_healthy": self._loop_thread.is_alive(),
             "type": "DynamicNixlStoreL2Adapter",
@@ -280,6 +461,7 @@ class DynamicNixlStoreL2Adapter(L2AdapterInterface):
             "stored_object_count": stored_object_count,
             "pinned_object_count": pinned_object_count,
             "event_loop_alive": self._loop_thread.is_alive(),
+            "consistency": consistency,
         }
 
     #####################
@@ -382,6 +564,11 @@ class DynamicNixlStoreL2Adapter(L2AdapterInterface):
                 with self._lock:
                     if key in self._memory_objects or key in self._inflight_stores:
                         continue
+                    if key in self._deleting:
+                        # The old file is about to be unlinked; publishing a
+                        # new one now would lose it to that unlink.
+                        self._count_tombstone_skip("store")
+                        continue
                     if self._total_bytes + mem_size > self._max_capacity_bytes:
                         logger.warning(
                             "Storage capacity exceeded, skipping store for key %s",
@@ -427,7 +614,7 @@ class DynamicNixlStoreL2Adapter(L2AdapterInterface):
                         )
                         with self._lock:
                             self._inflight_stores.discard(key)
-                            self._memory_objects[key] = store_obj
+                            self._index_add_locked(key, store_obj)
                             store_obj.decrease_pin_count()
                         stored_keys.append(key)
                         stored_sizes.append(mem_size)
@@ -475,6 +662,8 @@ class DynamicNixlStoreL2Adapter(L2AdapterInterface):
                 if obj is not None:
                     bitmap.set(i)
                     obj.increase_pin_count()
+                elif key in self._deleting:
+                    self._count_tombstone_skip("lookup")
                 else:
                     missing.append((i, key))
 
@@ -495,6 +684,10 @@ class DynamicNixlStoreL2Adapter(L2AdapterInterface):
                     continue
                 if key in self._inflight_stores:
                     continue
+                if key in self._deleting:
+                    # Deleted while we were stat-ing it: do not resurrect.
+                    self._count_tombstone_skip("lookup")
+                    continue
                 if self._total_bytes + obj_size > self._max_capacity_bytes:
                     logger.debug(
                         "Secondary lookup hit for %s but capacity exceeded, skipping",
@@ -506,7 +699,7 @@ class DynamicNixlStoreL2Adapter(L2AdapterInterface):
                     size=obj_size,
                     layout=None,
                 )
-                self._memory_objects[key] = obj
+                self._index_add_locked(key, obj)
                 self._total_bytes += obj_size
                 recovered_keys.append(key)
                 recovered_sizes.append(obj_size)
@@ -534,6 +727,7 @@ class DynamicNixlStoreL2Adapter(L2AdapterInterface):
         """
         bitmap = Bitmap(len(keys))
         accessed_keys: list[ObjectKey] = []
+        missing: list[tuple[ObjectKey, str]] = []
         try:
             # Read every present key's file concurrently (asyncio.gather
             # below) so a multi-chunk request does not pay per-file NIXL
@@ -566,6 +760,10 @@ class DynamicNixlStoreL2Adapter(L2AdapterInterface):
                 results = await asyncio.gather(*coros, return_exceptions=True)
                 for pos, result in zip(found_positions, results, strict=True):
                     if isinstance(result, BaseException):
+                        reason = _missing_file_reason(result)
+                        if reason is not None:
+                            missing.append((keys[pos], reason))
+                            continue
                         logger.error(
                             "Dynamic NIXL load failed for key %s: %r",
                             keys[pos],
@@ -578,6 +776,8 @@ class DynamicNixlStoreL2Adapter(L2AdapterInterface):
         except Exception:
             logger.exception("Dynamic NIXL load task %d failed", task_id)
 
+        if missing:
+            self._drop_missing_chunks(missing)
         if accessed_keys:
             self._notify_keys_accessed(accessed_keys)
         with self._lock:
