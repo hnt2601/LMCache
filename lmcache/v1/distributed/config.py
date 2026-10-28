@@ -110,9 +110,11 @@ def _parse_l1_common(
         "eviction_policy",
         "trigger_watermark",
         "eviction_ratio",
+        "idle_ttl_seconds",
+        "idle_ttl_batch",
     }:
         raise ValueError(
-            "eviction must contain policy, watermark and ratio settings only"
+            "eviction must contain policy, watermark, ratio and idle_ttl settings only"
         )
     policy = raw.get("eviction_policy", defaults.eviction_policy if defaults else None)
     if policy not in ("LRU", "ARC", "IsolatedLRU", "noop"):
@@ -482,6 +484,46 @@ class EvictionConfig:
 
     extra_logging_interval: float = field(default=10.0)
     """ Seconds between L1 memory usage log lines when extra logging is enabled. """
+
+    idle_ttl_seconds: float = field(default=0.0)
+    """ Data TTL: evict whole chunks idle for longer than this many seconds,
+    independently of the watermark. 0 disables it. Not the read/write LOCK TTL
+    (``--l1-read-ttl-seconds`` / ``--l1-write-ttl-seconds``). """
+
+    idle_ttl_batch: int = field(default=256)
+    """ Maximum number of chunks the idle-TTL pass deletes per 1 s tick. """
+
+    touch_on_l1_hit: bool = field(default=False)
+    """ L2 only: an L1 hit also refreshes the key in this L2 adapter's
+    eviction-policy order (in memory, no I/O). Off keeps the upstream
+    behavior where only an L2 load counts as an L2 access. The idle-TTL
+    clock of L2 is refreshed by L1 hits whenever L2 idle TTL is on. """
+
+    def __post_init__(self) -> None:
+        validate_idle_ttl(self.idle_ttl_seconds, self.idle_ttl_batch)
+
+
+def validate_idle_ttl(idle_ttl_seconds: object, idle_ttl_batch: object) -> None:
+    """Reject malformed idle-TTL settings.
+
+    Raises:
+        ValueError: ``idle_ttl_seconds`` is negative or not a number, or
+            ``idle_ttl_batch`` is not a positive integer.
+    """
+    if isinstance(idle_ttl_seconds, bool) or not isinstance(
+        idle_ttl_seconds, (int, float)
+    ):
+        raise ValueError(f"idle_ttl_seconds must be a number, got {idle_ttl_seconds!r}")
+    if idle_ttl_seconds < 0:
+        raise ValueError(f"idle_ttl_seconds must be >= 0, got {idle_ttl_seconds!r}")
+    if (
+        isinstance(idle_ttl_batch, bool)
+        or not isinstance(idle_ttl_batch, int)
+        or idle_ttl_batch <= 0
+    ):
+        raise ValueError(
+            f"idle_ttl_batch must be a positive integer, got {idle_ttl_batch!r}"
+        )
 
 
 @dataclass
@@ -897,6 +939,27 @@ def add_storage_manager_args(
         help="Time to live for each object's read lock. Default is 300s.",
     )
 
+    # L1 data TTL (distinct from the lock TTLs above)
+    idle_group = parser.add_argument_group(
+        "L1 idle TTL",
+        "Evict L1 chunks idle for longer than a TTL, independently of the "
+        "watermark. Not the read/write lock TTL.",
+    )
+    idle_group.add_argument(
+        "--l1-idle-ttl-seconds",
+        type=float,
+        default=0.0,
+        help="Evict whole L1 chunks idle for longer than this many seconds. "
+        "0 (default) disables it. When an L2 adapter also sets "
+        "eviction.idle_ttl_seconds, that value must be >= this one.",
+    )
+    idle_group.add_argument(
+        "--l1-idle-ttl-batch",
+        type=int,
+        default=256,
+        help="Maximum L1 chunks the idle-TTL pass deletes per second. Default is 256.",
+    )
+
     # Eviction Config
     eviction_group = parser.add_argument_group(
         "Eviction Policy", "Configuration for eviction policies"
@@ -1016,6 +1079,8 @@ def parse_args_to_config(
             args.eviction_ratio,
             getattr(args, "enable_extra_logging", False),
             getattr(args, "extra_logging_interval", 10.0),
+            idle_ttl_seconds=getattr(args, "l1_idle_ttl_seconds", 0.0),
+            idle_ttl_batch=getattr(args, "l1_idle_ttl_batch", 256),
         )
         if args.eviction_policy is not None
         else None
@@ -1133,6 +1198,8 @@ def parse_args_to_config(
         eviction_ratio=args.eviction_ratio,
         extra_logging_enabled=getattr(args, "enable_extra_logging", False),
         extra_logging_interval=getattr(args, "extra_logging_interval", 10.0),
+        idle_ttl_seconds=getattr(args, "l1_idle_ttl_seconds", 0.0),
+        idle_ttl_batch=getattr(args, "l1_idle_ttl_batch", 256),
     )
 
     l2_adapter_config = parse_args_to_l2_adapters_config(args)

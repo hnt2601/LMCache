@@ -422,18 +422,6 @@ class DynamicNixlStoreL2Adapter(L2AdapterInterface):
         self._consistency_stats["tombstone_skips"] += 1
         _TOMBSTONE_SKIP_COUNTER.add(1, {"op": op})
 
-    def _partial_chunk_count_locked(self) -> int:
-        """Chunks with fewer objects than the largest chunk of the same model."""
-        largest: dict[tuple[str, str], int] = {}
-        for (model, _hash, salt), members in self._chunk_members.items():
-            group = (model, salt)
-            largest[group] = max(largest.get(group, 0), len(members))
-        return sum(
-            1
-            for (model, _hash, salt), members in self._chunk_members.items()
-            if len(members) < largest[(model, salt)]
-        )
-
     # ``get_usage`` is inherited from L2AdapterInterface; byte accounting
     # is driven by ``_notify_keys_*`` through the base class now.
 
@@ -450,7 +438,6 @@ class DynamicNixlStoreL2Adapter(L2AdapterInterface):
             consistency = dict(self._consistency_stats)
             consistency["deleting_objects"] = len(self._deleting)
             consistency["stored_chunk_count"] = len(self._chunk_members)
-            consistency["partial_chunks"] = self._partial_chunk_count_locked()
         consistency["store_dir_recreated"] = getattr(
             self.nixl_agent, "dir_recreated_count", 0
         )

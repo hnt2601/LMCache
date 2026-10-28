@@ -242,9 +242,15 @@ class L2AdapterConfigBase(ABC):
                 "eviction": {
                     "eviction_policy": "LRU",
                     "trigger_watermark": 0.8,
-                    "eviction_ratio": 0.2
+                    "eviction_ratio": 0.2,
+                    "idle_ttl_seconds": 3600,
+                    "idle_ttl_batch": 256,
+                    "touch_on_l1_hit": false
                 }
             }
+
+        ``idle_ttl_seconds`` (0 or null = off), ``idle_ttl_batch`` and
+        ``touch_on_l1_hit`` are optional; see :class:`EvictionConfig`.
 
         Returns ``None`` when the key is absent (eviction disabled).
         """
@@ -263,10 +269,20 @@ class L2AdapterConfigBase(ABC):
                 "eviction.eviction_policy must be 'LRU', 'ARC', "
                 f"'IsolatedLRU', or 'noop', got {policy!r}"
             )
+        # ``idle_ttl_seconds: null`` is accepted as "off", like the absent key.
+        idle_ttl = eviction_dict.get("idle_ttl_seconds")
+        touch = eviction_dict.get("touch_on_l1_hit", False)
+        if not isinstance(touch, bool):
+            raise ValueError(
+                f"eviction.touch_on_l1_hit must be a boolean, got {touch!r}"
+            )
         return EvictionConfig(
             eviction_policy=policy,
             trigger_watermark=float(eviction_dict.get("trigger_watermark", 0.8)),
             eviction_ratio=float(eviction_dict.get("eviction_ratio", 0.2)),
+            idle_ttl_seconds=0.0 if idle_ttl is None else idle_ttl,
+            idle_ttl_batch=eviction_dict.get("idle_ttl_batch", 256),
+            touch_on_l1_hit=touch,
         )
 
     @staticmethod

@@ -98,6 +98,28 @@ _L1_WRITE_TAG = "storage_manager"
 L1WriteCompletion = list[tuple[int, list[ObjectKey]]]
 
 
+def _validate_idle_ttl_tiers(
+    l1_configs: list[EvictionConfig], l2_configs: list[EvictionConfig]
+) -> None:
+    """Require every L2 idle TTL to be at least the longest L1 idle TTL.
+
+    An L2 copy must outlive the L1 copy it backs: L1 hits refresh the L2
+    clock (cross-tier touch), so with T2 >= T1 a chunk leaves L1 by TTL
+    before, or together with, its L2 copy and a lookup never finds the L1
+    tail of a prefix whose L2 part has already expired.
+
+    Raises:
+        ValueError: An L2 adapter's idle TTL is on and shorter than an L1's.
+    """
+    l1_max = max((c.idle_ttl_seconds for c in l1_configs), default=0.0)
+    for l2 in l2_configs:
+        if 0 < l2.idle_ttl_seconds < l1_max:
+            raise ValueError(
+                f"L2 eviction.idle_ttl_seconds ({l2.idle_ttl_seconds:g}) must be "
+                f">= --l1-idle-ttl-seconds ({l1_max:g})"
+            )
+
+
 class StorageManager:
     def __init__(
         self,
@@ -231,6 +253,10 @@ class StorageManager:
                             eviction_config=ac.eviction_config,
                         )
                     )
+            _validate_idle_ttl_tiers(
+                [c.eviction or config.eviction_config for c in self._l1_configs],
+                [st.eviction_config for st in l2_eviction_states],
+            )
             self._l2_eviction_controller = L2EvictionController(
                 l2_eviction_states, quota_manager=self._quota_manager
             )
@@ -697,6 +723,9 @@ class StorageManager:
         """
         for manager in self._l1_managers_by_id.values():
             manager.touch_keys(keys)
+        # Cross-tier touch (patch 0027): no-op unless an L2 adapter has idle
+        # TTL or touch_on_l1_hit on. In memory only.
+        self._l2_eviction_controller.on_l1_keys_touched(keys)
 
     def delete_l1_keys(
         self, keys: list[ObjectKey], force: bool = False
