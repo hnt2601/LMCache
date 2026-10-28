@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TypeGuard
 import argparse
+import os
 import shutil
 import signal
 import sys
@@ -59,6 +60,9 @@ from lmcache.v1.multiprocess.modules.engine_driven_transfer import (
 )
 from lmcache.v1.multiprocess.modules.experimental import EXPERIMENTAL_TRANSFER
 from lmcache.v1.multiprocess.modules.experimental.qstore import QStoreModule
+from lmcache.v1.multiprocess.modules.gpu_helper_transfer import (
+    GPUHelperTransferModule,
+)
 from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
     IPCReleaseConfig,
     LMCacheDrivenTransferModule,
@@ -176,7 +180,7 @@ class MPCacheServer:
         stuck = [
             seconds
             for module in self._modules
-            if isinstance(module, LMCacheDrivenTransferModule)
+            if isinstance(module, (LMCacheDrivenTransferModule, GPUHelperTransferModule))
             and (seconds := module.stuck_release_seconds()) is not None
         ]
         return max(stuck) if stuck else None
@@ -248,16 +252,29 @@ def _build_server_components(
         stuck_action=mp_config.ipc_release_stuck_action,
         stale_wait_seconds=mp_config.ipc_release_stale_wait_seconds,
     )
-    if mp_config.supported_transfer_mode == "lmcache_driven":
-        transfer_modules.append(
-            LMCacheDrivenTransferModule(ctx, release_config=release_config)
+    if mp_config.gpu_helper and mp_config.supported_transfer_mode == "engine_driven":
+        raise ValueError("--gpu-helper applies to the lmcache_driven transfer path")
+    if mp_config.gpu_helper and (mp_config.engine_type == "blend" or mp_config.enable):
+        raise ValueError(
+            "--gpu-helper cannot be combined with the blend engine or experimental "
+            "transfer modules (they need in-process cache contexts)"
         )
+
+    def _lmcache_driven_module() -> EngineModule:
+        if mp_config.gpu_helper:
+            return GPUHelperTransferModule(
+                ctx,
+                call_timeout_seconds=mp_config.gpu_helper_call_timeout_seconds,
+                register_timeout_seconds=mp_config.gpu_helper_register_timeout_seconds,
+            )
+        return LMCacheDrivenTransferModule(ctx, release_config=release_config)
+
+    if mp_config.supported_transfer_mode == "lmcache_driven":
+        transfer_modules.append(_lmcache_driven_module())
     elif mp_config.supported_transfer_mode == "engine_driven":
         transfer_modules.append(EngineDrivenTransferModule(ctx))
     elif mp_config.supported_transfer_mode == "auto":
-        transfer_modules.append(
-            LMCacheDrivenTransferModule(ctx, release_config=release_config)
-        )
+        transfer_modules.append(_lmcache_driven_module())
         transfer_modules.append(EngineDrivenTransferModule(ctx))
     else:
         raise ValueError(
@@ -271,7 +288,14 @@ def _build_server_components(
     liveness_targets: list[InstanceLivenessTarget] = [
         m
         for m in transfer_modules
-        if isinstance(m, (LMCacheDrivenTransferModule, EngineDrivenTransferModule))
+        if isinstance(
+            m,
+            (
+                LMCacheDrivenTransferModule,
+                EngineDrivenTransferModule,
+                GPUHelperTransferModule,
+            ),
+        )
     ]
 
     blend_module: EngineModule | None = None
@@ -375,7 +399,14 @@ def _build_server_components(
         registration_targets=[
             m
             for m in transfer_modules
-            if isinstance(m, (LMCacheDrivenTransferModule, EngineDrivenTransferModule))
+            if isinstance(
+                m,
+                (
+                    LMCacheDrivenTransferModule,
+                    EngineDrivenTransferModule,
+                    GPUHelperTransferModule,
+                ),
+            )
         ],
         worker_reap_timeout_seconds=mp_config.worker_reap_timeout_seconds,
         worker_registration_grace_seconds=mp_config.worker_registration_grace_seconds,
@@ -455,20 +486,42 @@ def run_cache_server(
         event_bus, obs_config, storage_manager_config, instance_id=mp_config.instance_id
     )
 
-    # When the engine-driven path is loaded (auto or engine_driven):
-    # apply shm_name from mp_config and verify capacity.
+    # When the engine-driven path is loaded (auto or engine_driven), or the
+    # GPU helpers must map the L1: apply shm_name from mp_config and verify
+    # capacity.
+    if mp_config.gpu_helper and len(storage_manager_config.l1_manager_configs) != 1:
+        raise ValueError("--gpu-helper needs exactly one L1 manager")
     if (
-        mp_config.supported_transfer_mode != "lmcache_driven"
-        and len(storage_manager_config.l1_manager_configs) == 1
-    ):
+        mp_config.supported_transfer_mode != "lmcache_driven" or mp_config.gpu_helper
+    ) and len(storage_manager_config.l1_manager_configs) == 1:
         mem_cfg = storage_manager_config.l1_manager_config.memory_config
         if mp_config.shm_name is not None:
             mem_cfg.shm_name = mp_config.shm_name
+        if mp_config.gpu_helper:
+            # The helpers map the pool by name, so it must exist in full
+            # from the start: no lazy growth, and a name even when none was
+            # configured. The pool stays private to this server's lifetime
+            # (stale segments of the same name are unlinked at allocation).
+            if mem_cfg.use_lazy:
+                logger.info("--gpu-helper: allocating the L1 pool eagerly (no lazy growth)")
+                mem_cfg.use_lazy = False
+            if not mem_cfg.shm_name:
+                mem_cfg.shm_name = f"lmcache_l1_pool_helper_{os.getpid()}"
+            if mem_cfg.devdax_path or mem_cfg.use_hugepages:
+                raise ValueError(
+                    "--gpu-helper needs a plain shm-backed DRAM L1 (no Device-DAX, "
+                    "no hugepages)"
+                )
         if mem_cfg.shm_name and sys.platform.startswith("linux"):
             logger.info("Checking if shm capacity is larger than L1 request")
             try:
                 free_bytes = shutil.disk_usage("/dev/shm").free
                 if free_bytes < mem_cfg.size_in_bytes:
+                    if mp_config.gpu_helper:
+                        raise ValueError(
+                            "--gpu-helper: insufficient /dev/shm capacity for the L1 "
+                            f"pool: need {mem_cfg.size_in_bytes} bytes, have {free_bytes}"
+                        )
                     logger.warning(
                         "Insufficient /dev/shm capacity: need %d bytes, have %d bytes. "
                         "Disabling SHM, falling back to pickle.",

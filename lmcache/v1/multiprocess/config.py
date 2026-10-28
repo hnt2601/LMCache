@@ -168,6 +168,22 @@ class MPServerConfig:
     whose request loop hangs (for example behind a stuck GPU stream). Must
     exceed the slowest REGISTER. 0 disables the check."""
 
+    gpu_helper: bool = False
+    """Run the lmcache-driven data plane (KV IPC mappings, events, copy
+    kernels) in one helper process per registration, restricted to the
+    worker's GPU, so this process never opens a CUDA context on a worker's
+    GPU and a helper's exit gives the GPU back. Needs an eagerly allocated,
+    shm-backed DRAM L1 (forced at startup); not combined with the blend engine
+    or experimental transfer modules."""
+
+    gpu_helper_call_timeout_seconds: float = 30.0
+    """How long a STORE/RETRIEVE waits for its helper to queue the device work
+    before the helper is killed and the worker told to re-register."""
+
+    gpu_helper_register_timeout_seconds: float = 600.0
+    """How long REGISTER waits for a new helper to start, map and pin the L1
+    pool and build the cache context."""
+
     enable: list[str] = field(default_factory=list)
     """List of experimental transfer modules to enable. Options: transfer_query
     (see lmcache.v1.multiprocess.modules.experimental.__init___.py)."""
@@ -549,6 +565,30 @@ def add_mp_server_args(
         "Only enable it on a trusted network.",
     )
     mp_group.add_argument(
+        "--gpu-helper",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run the lmcache-driven data plane in one helper process per "
+        "worker registration, restricted to that worker's GPU, so the server "
+        "process holds no CUDA context on any worker GPU and the GPU is fully "
+        "returned when the worker leaves. Forces an eager, shm-backed DRAM L1. "
+        "(Default is False)",
+    )
+    mp_group.add_argument(
+        "--gpu-helper-call-timeout-seconds",
+        type=float,
+        default=30.0,
+        help="Seconds a STORE/RETRIEVE waits for its GPU helper to queue the "
+        "device work before the helper is killed. Default is 30.",
+    )
+    mp_group.add_argument(
+        "--gpu-helper-register-timeout-seconds",
+        type=float,
+        default=600.0,
+        help="Seconds REGISTER waits for a new GPU helper to start, pin the L1 "
+        "pool and build its cache context. Default is 600.",
+    )
+    mp_group.add_argument(
         "--separate-object-groups",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -723,6 +763,9 @@ def parse_args_to_mp_server_config(
         ipc_release_stuck_action=args.ipc_release_stuck_action,
         ipc_release_stuck_unhealthy_seconds=args.ipc_release_stuck_unhealthy_seconds,
         mq_loop_stall_unhealthy_seconds=args.mq_loop_stall_unhealthy_seconds,
+        gpu_helper=args.gpu_helper,
+        gpu_helper_call_timeout_seconds=args.gpu_helper_call_timeout_seconds,
+        gpu_helper_register_timeout_seconds=args.gpu_helper_register_timeout_seconds,
         enable=args.enable or [],
         server_modules=parse_server_module_specs(args.server_module or []),
     )
